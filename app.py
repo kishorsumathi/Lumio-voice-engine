@@ -12,8 +12,29 @@ from src.anchor_voice.components.live_transcription import get_live_html
 
 
 # ── Page config ──
-st.set_page_config(page_title="Lumio", page_icon="🎙️", layout="wide")
-st.title("Lumio - Transcription")
+st.set_page_config(page_title="Lumino Transcription Engine", page_icon="🎙️", layout="wide")
+
+# ── Login ──
+if "authenticated" not in st.session_state:
+    st.session_state["authenticated"] = False
+
+if not st.session_state["authenticated"]:
+    st.title("🎙️ Lumino Transcription Engine")
+    st.markdown("---")
+    col_left, col_center, col_right = st.columns([1, 2, 1])
+    with col_center:
+        st.subheader("Login")
+        username = st.text_input("Username", key="login_user")
+        password = st.text_input("Password", type="password", key="login_pass")
+        if st.button("Login", key="login_btn", use_container_width=True):
+            if username == "Luminovoice" and password == "voice@testdevelopment":
+                st.session_state["authenticated"] = True
+                st.rerun()
+            else:
+                st.error("Invalid username or password.")
+    st.stop()
+
+st.title("Lumino Transcription Engine")
 
 # ── Sidebar: Model Selection & Keyterms ──
 with st.sidebar:
