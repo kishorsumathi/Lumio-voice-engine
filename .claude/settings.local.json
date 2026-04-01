@@ -1,0 +1,21 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(npx tsx:*)",
+      "Bash(npx playwright:*)",
+      "Bash(.venv/Scripts/python.exe *)",
+      "Bash(python /tmp/gpj_playwright_setup.py *)",
+      "Bash(command -v mem-search)",
+      "Read(//c/Users/Dell/.local/bin/**)",
+      "Bash(pip show:*)",
+      "mcp__plugin_claude-mem_mcp-search__search",
+      "WebSearch",
+      "Read(//c/Users/Dell/.claude/**)",
+      "Read(//c/Users/Dell/.claude/projects/C--Users-Dell/**)",
+      "Bash(cat ~/.claude/hooks/*.json)"
+    ]
+  },
+  "enabledMcpjsonServers": [
+    "scrapling"
+  ]
+}

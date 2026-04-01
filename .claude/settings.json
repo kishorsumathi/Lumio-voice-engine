@@ -1,0 +1,63 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-settings.json",
+  "cleanupPeriodDays": 30,
+  "env": {
+    "CLAUDE_CODE_ENABLE_TELEMETRY": "1",
+    "OTEL_METRICS_EXPORTER": "otlp",
+    "OTEL_LOGS_EXPORTER": "otlp",
+    "OTEL_EXPORTER_OTLP_PROTOCOL": "http/protobuf",
+    "OTEL_EXPORTER_OTLP_METRICS_TEMPORALITY_PREFERENCE": "cumulative",
+    "OTEL_EXPORTER_OTLP_ENDPOINT": "https://otlp-gateway-prod-ap-south-1.grafana.net/otlp",
+    "OTEL_EXPORTER_OTLP_HEADERS": "Authorization=Basic%20MTU2ODY3NjpnbGNfZXlKdklqb2lNVGN3T0RBd09DSXNJbTRpT2lKNWIzVnlMV2R5WVdaaGJtRXRkRzlyWlc0aUxDSnJJam9pT1ZWUVlUa3dNMjlIY2preU9UWXdURk5wY0ZreFkwMURJaXdpYlNJNmV5SnlJam9pY0hKdlpDMWhjQzF6YjNWMGFDMHhJbjE5",
+    "OTEL_METRIC_EXPORT_INTERVAL": "10000",
+    "OTEL_LOG_EXPORT_INTERVAL": "10000"
+  },
+  "permissions": {
+    "allow": [
+      "Bash(curl *)",
+      "Bash(npm run lint)",
+      "Bash(npm run test *)",
+      "Read(~/.zshrc)"
+    ],
+    "deny": [
+      "Read(./.env)",
+      "Read(./.env.*)",
+      "Read(./secrets/**)"
+    ]
+  },
+  "enabledMcpjsonServers": [
+    "scrapling",
+    "mcp-search"
+  ],
+  "hooks": {
+    "Notification": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "powershell.exe -Command \"[System.Reflection.Assembly]::LoadWithPartialName('System.Windows.Forms'); [System.Windows.Forms.MessageBox]::Show('Claude Code needs your attention', 'Claude Code')\""
+          }
+        ]
+      }
+    ]
+  },
+  "enabledPlugins": {
+    "everything-claude-code@everything-claude-code": true,
+    "pyright-lsp@claude-plugins-official": true
+  },
+  "extraKnownMarketplaces": {
+    "everything-claude-code": {
+      "source": {
+        "source": "github",
+        "repo": "affaan-m/everything-claude-code"
+      }
+    }
+  },
+  "companyAnnouncements": [
+    "Welcome to Lumio Corp! Review our code guidelines at docs.acme.com",
+    "Reminder: Code reviews required for all PRs",
+    "New security policy in effect"
+  ],
+  "autoMemoryDirectory": ".claude/memoryproject/"
+}

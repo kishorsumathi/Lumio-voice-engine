@@ -11,7 +11,7 @@ wheels/
 
 # Environment
 .env
-
+.DS_Store
 # Audio library data (user uploads)
 data/audio_library/*.mp3
 data/audio_library/*.wav
