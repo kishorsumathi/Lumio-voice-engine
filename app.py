@@ -49,6 +49,7 @@ with st.sidebar:
         st.warning(f"⚠️ {selected_model} is under development and not yet available for transcription.")
     else:
         st.success(f"✅ {selected_model}")
+    st.caption("⚠️ Multilingual support is currently disabled. Please upload English audio only.")
 
     st.markdown("---")
     st.subheader("Keyterm Prompting")

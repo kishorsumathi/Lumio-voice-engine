@@ -16,6 +16,7 @@ AUDIO_TYPES = ["wav", "mp3", "m4a", "flac", "ogg", "wma", "aac", "webm", "mp4"]
 
 MODELS = {
     "Deepgram Nova-3": {"provider": "deepgram", "model": "nova-3", "available": True},
+    "Deepgram Nova-3 Medical": {"provider": "deepgram", "model": "nova-3-medical", "available": True},
     "Deepgram Nova-2": {"provider": "deepgram", "model": "nova-2", "available": True},
     "OpenAI Whisper Large v3 (Coming Soon)": {"provider": "openai", "model": "whisper-large-v3", "available": False},
     "OpenAI Whisper Large v3 Turbo (Coming Soon)": {"provider": "openai", "model": "whisper-large-v3-turbo", "available": False},
