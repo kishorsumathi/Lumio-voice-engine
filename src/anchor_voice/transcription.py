@@ -18,6 +18,7 @@ def transcribe_audio(audio_bytes: bytes, model_key: str, keyterms: list[str] | N
         model=model_info["model"],
         language="en-IN",
         smart_format=True,
+        punctuate=True,
         diarize=True,
         utterances=True,
     )
