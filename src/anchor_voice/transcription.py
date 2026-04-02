@@ -30,6 +30,15 @@ def transcribe_audio(audio_bytes: bytes, model_key: str, keyterms: list[str] | N
     return group_words_by_speaker(words)
 
 
+def _get_word(w) -> str:
+    """Get punctuated word if available, otherwise fall back to raw word."""
+    if hasattr(w, "punctuated_word") and w.punctuated_word:
+        return w.punctuated_word
+    if isinstance(w, dict):
+        return w.get("punctuated_word", w.get("word", ""))
+    return w.word if hasattr(w, "word") else ""
+
+
 def group_words_by_speaker(words) -> list[dict]:
     if not words:
         return []
@@ -44,9 +53,9 @@ def group_words_by_speaker(words) -> list[dict]:
             if current_words:
                 utterances.append({"speaker": current_speaker, "text": " ".join(current_words)})
             current_speaker = speaker
-            current_words = [w.word if hasattr(w, "word") else w.get("word", "")]
+            current_words = [_get_word(w)]
         else:
-            current_words.append(w.word if hasattr(w, "word") else w.get("word", ""))
+            current_words.append(_get_word(w))
     if current_words:
         utterances.append({"speaker": current_speaker, "text": " ".join(current_words)})
     return utterances
