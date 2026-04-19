@@ -27,6 +27,8 @@ dependencies = [
     "structlog>=24.1",
     # Environment
     "python-dotenv>=1.0",
+    # Language detection (fallback on en-IN passthrough retry — Hindi vs Marathi, etc.)
+    "lingua-language-detector>=2.0",
 ]
 
 [project.scripts]

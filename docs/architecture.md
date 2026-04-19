@@ -1,6 +1,8 @@
-# Anchor Voice — Architecture & Pipeline Reference
+# Lumio Voice / Anchor Voice — Architecture & Pipeline Reference
 
 ## Overview
+
+**Lumio Voice** is the product name for this stack; the codebase and AWS resources use the **anchor-voice** naming convention. This document describes only the **processing pipeline and AWS data plane** (ingestion, worker, storage, events) — not client applications or consoles.
 
 Anchor Voice is an event-driven AWS pipeline that transcribes long-form audio (medical sessions) using Sarvam Saaras v3 with cross-chunk speaker diarization — entirely without an external diarization model.
 
@@ -204,10 +206,13 @@ For long jobs (e.g. **~1200+ segments**), batching reduces translate RPCs by rou
 
 Mayura v1 with `source_language_code="auto"` occasionally **returns the input unchanged** on heavily code-mixed (Hinglish / code-switched) segments when the target is `en-IN` — the output still contains Devanagari / Bengali / Tamil / etc. characters. After the main batch pass completes for `en-IN`, a second surgical pass runs:
 
-1. **Detect** — for every translated segment, check if the output still contains any Indic script (Devanagari `\u0900–\u097F`, Bengali `\u0980–\u09FF`, Gurmukhi `\u0A00–\u0A7F`, Gujarati `\u0A80–\u0AFF`, Oriya `\u0B00–\u0B7F`, Tamil `\u0B80–\u0BFF`, Telugu `\u0C00–\u0C7F`, Kannada `\u0C80–\u0CFF`, Malayalam `\u0D00–\u0D7F`). If so, pick the matching Mayura source code (`hi-IN`, `bn-IN`, `pa-IN`, `gu-IN`, `od-IN`, `ta-IN`, `te-IN`, `kn-IN`, `ml-IN`). Also retry exact source-echoes where the source itself contains Indic script.
-2. **Retry** — re-translate **only** flagged segments, one-by-one, with the **explicit** detected source code (no `auto`), `model="mayura:v1"`, `mode="formal"`. Runs through the same 10-worker pool and global RPM throttle.
-3. **Long-segment safety** — if a flagged segment is **>950 chars**, it's pre-split via `_split_long_text` (sentence/word boundaries) into sub-1000-char pieces and each piece retried with the same source code, then rejoined. Prevents Mayura’s 1000-char 400 error on the retry path.
-4. **Accept-only-if-better** — keep the retry only when the output is **non-empty**, contains **no Indic script**, and is **not byte-identical** to the source. Otherwise the original (passthrough) translation is kept — never overwrite with worse output.
+1. **Detect (entry gate — byte-level script check)** — for every translated segment, check if the output still contains any Indic script (Devanagari `\u0900–\u097F`, Bengali `\u0980–\u09FF`, Gurmukhi `\u0A00–\u0A7F`, Gujarati `\u0A80–\u0AFF`, Oriya `\u0B00–\u0B7F`, Tamil `\u0B80–\u0BFF`, Telugu `\u0C00–\u0C7F`, Kannada `\u0C80–\u0CFF`, Malayalam `\u0D00–\u0D7F`). The output is also flagged when it's a byte-for-byte echo of an Indic-script source. This script check is cheap and deterministic — it never decides the wrong thing about *whether* to retry, only triggers the next step.
+2. **Pick source code (two-tier: Lingua for shared scripts, Unicode ranges for unique ones)** — once a segment is flagged, the *source text* (not the failed output) is passed to `lang_detect.detect_source_code` which asks [`lingua-language-detector`](https://github.com/pemistahl/lingua-py) restricted to the **9** Indian languages lingua actually ships models for: Hindi, Marathi, Bengali, Gujarati, Punjabi, Tamil, Telugu, Urdu, and English. Lingua earns its keep on the only script with real ambiguity — **Devanagari (Hindi vs Marathi)**; the old code always mapped all Devanagari to `hi-IN`, bleeding Marathi quality. For **Kannada** (`\u0C80-\u0CFF`), **Malayalam** (`\u0D00-\u0D7F`), **Odia** (`\u0B00-\u0B7F`), and every other Indic script whose Unicode block is unique, the script-range regex (`_detect_indic_source`) is already 100% accurate and runs as a zero-cost fallback whenever lingua returns `None`. The fallback also fires when: lingua's top-1 confidence is below **0.75**, the text is under 10 chars, lingua isn't installed, or lingua wrongly returns `ENGLISH` on a script-confirmed Indic segment.
+3. **Retry** — re-translate **only** flagged segments, one-by-one, with the **explicit** detected source code (no `auto`), `model="mayura:v1"`, `mode="formal"`. Runs through the same 10-worker pool and global RPM throttle.
+4. **Long-segment safety** — if a flagged segment is **>950 chars**, it's pre-split via `_split_long_text` (sentence/word boundaries) into sub-1000-char pieces and each piece retried with the same source code, then rejoined. Prevents Mayura’s 1000-char 400 error on the retry path.
+5. **Accept-only-if-better** — keep the retry only when the output is **non-empty**, contains **no Indic script**, and is **not byte-identical** to the source. Otherwise the original (passthrough) translation is kept — never overwrite with worse output.
+
+> **Why not use Lingua on the main path?** Saaras v3 (`mode=codemix`, `language_code=unknown`) always emits native script, so the byte-level script regex is a perfect "is this non-English?" gate on the way into Mayura. Running a statistical LID on every segment would cost CPU without changing a single decision there. Lingua only earns its keep on the retry path, where the question changes from *whether* the segment is Indic to *which Indic language* (Hindi vs Marathi being the expensive confusion).
 
 Log lines per run: `"en-IN passthrough retry: N/M segments (by source: {...})"` and `"en-IN passthrough retry: K segments repaired"`.
 
@@ -221,7 +226,7 @@ Observed impact on the Hinglish reference audio (1265 segments): remaining Indic
 | Request rejected for length (400, “exceed” / over limit) | `_split_long_text` splits at sentence boundaries (English `.?!`, Hindi `।`), translates sub-chunks, joins |
 | HTTP **429** | Sleep 60s, retry (tenacity on `_translate_batch_text`) |
 | “Unable to detect” source language | Retry same text with explicit `hi-IN` source |
-| `en-IN` output still contains Indic script (Mayura auto-detect passthrough) | Second pass: retry each flagged segment with the Indic source code matching the detected script; pre-split >950 chars first; keep retry only if cleaner |
+| `en-IN` output still contains Indic script (Mayura auto-detect passthrough) | Second pass: Lingua picks the Mayura source code from the original text (falls back to script-range regex on low confidence / missing dep); re-translate each flagged segment with that explicit source; pre-split >950 chars first; keep retry only if cleaner |
 | Batch-level exception after retries | Empty `translated_text` for every segment in that batch; pipeline continues |
 
 ---
@@ -340,7 +345,7 @@ This is a sliding window (not a fixed 60s bucket), so the rate is smooth with no
 | Translation batch split mismatch | Re-translate each segment individually |
 | Mayura 400 / input exceeds limit | Sentence-split (`।` / `.?!`), translate pieces, rejoin |
 | Auto language detection failure | Retry with `hi-IN` explicit source |
-| `en-IN` output still in Indic script (auto-detect passthrough) | Surgical retry with detected Indic source (`hi/bn/pa/gu/od/ta/te/kn/ml-IN`), pre-split if >950 chars |
+| `en-IN` output still in Indic script (auto-detect passthrough) | Surgical retry with Lingua-picked Indic source (Hindi vs Marathi disambiguation, 11-language allow-list, 0.75 confidence floor), falls back to script-range regex; pre-split if >950 chars |
 | Translation segment failure | Empty string stored, pipeline continues |
 | pyannote / diarization | Removed — not used. Sarvam provides per-chunk diarization |
 | Audio over 60 min | VAD chunking with overlap — no size limit |

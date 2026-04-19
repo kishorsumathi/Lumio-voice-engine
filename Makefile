@@ -1,4 +1,4 @@
-.PHONY: help install db-up db-down init-db worker-build worker-push run-local lint clean dashboard deploy deploy-image deploy-eventbridge send-test
+.PHONY: help install db-up db-down init-db worker-build worker-push run-local lint clean dashboard deploy deploy-image deploy-eventbridge deploy-ui deploy-ui-image ui-build ui-ip send-test
 
 REGION         ?= ap-south-1
 ACCOUNT_ID     := $(shell aws sts get-caller-identity --query Account --output text 2>/dev/null)
@@ -27,6 +27,10 @@ help:
 	@echo "    make deploy         Full deploy (SARVAM_API_KEY + RDS_MASTER_PASSWORD in env)"
 	@echo "    make deploy-image   Rebuild image + register new task def revision only"
 	@echo "    make deploy-eventbridge  Wire S3 uploads to input SQS via EventBridge"
+	@echo "    make deploy-ui      Deploy Streamlit UI (ECR + IAM + SG + ECS service, public IP)"
+	@echo "    make deploy-ui-image Rolling refresh of UI image only (code changes)"
+	@echo "    make ui-build       Build UI Docker image locally"
+	@echo "    make ui-ip          Print the UI's current public URL"
 	@echo "    make send-test f=s3://bucket/key"
 	@echo ""
 	@echo "  Observability"
@@ -81,6 +85,18 @@ deploy-image:
 
 deploy-eventbridge:
 	./scripts/deploy.sh eventbridge
+
+deploy-ui:
+	./scripts/deploy.sh ui
+
+deploy-ui-image:
+	./scripts/deploy.sh ui-image
+
+ui-build:
+	docker build --platform linux/amd64 -t anchor-voice-ui:latest ui/
+
+ui-ip:
+	@./scripts/deploy.sh ui-ip
 
 send-test:
 	@test -n "$(f)" || (echo "Usage: make send-test f=s3://bucket/key" && exit 1)

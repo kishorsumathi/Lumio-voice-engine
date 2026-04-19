@@ -55,6 +55,17 @@ LAMBDA_ROLE="${NS}-job-dispatcher-role"
 DASHBOARD_NAME="${NS}"
 IMAGE_URI="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${ECR_REPO}:latest"
 
+# ── UI (Streamlit, public-IP Fargate) ────────────────────────────────────────
+UI_ECR_REPO="${APP}/ui"
+UI_IMAGE_URI="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${UI_ECR_REPO}:latest"
+UI_TASK_FAMILY="${NS}-ui"
+UI_CONTAINER_NAME="${NS}-ui"
+UI_SERVICE="${NS}-ui"
+UI_LOG_GROUP="/ecs/${NS}-ui"
+UI_TASK_ROLE="${NS}-ui-task-role"
+UI_SG_NAME="${NS}-ui"
+UI_PORT=8501
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 STATE_DIR="${REPO_ROOT}/.deploy-state"
@@ -81,6 +92,119 @@ idempotent() {
 }
 
 PHASE="${1:-all}"
+
+# ── State loaders (standalone-safe) ───────────────────────────────────────────
+# Every phase after phase_sqs / phase_iam writes a `.env` cache under
+# .deploy-state/. When a later phase runs on its own (e.g. `deploy-image`,
+# `deploy-eventbridge`), those caches may not exist — fall back to querying
+# AWS by the same deterministic resource names the script itself uses.
+load_sqs_state() {
+  if [[ -f "${STATE_DIR}/sqs.env" ]]; then
+    # shellcheck disable=SC1091
+    source "${STATE_DIR}/sqs.env"
+    return
+  fi
+  warn "No ${STATE_DIR}/sqs.env — querying AWS for SQS queue URLs/ARNs"
+  INPUT_QUEUE_URL="$(aws sqs get-queue-url --region "${AWS_REGION}" \
+    --queue-name "${INPUT_QUEUE}" --query QueueUrl --output text)"
+  INPUT_QUEUE_ARN="$(aws sqs get-queue-attributes --region "${AWS_REGION}" \
+    --queue-url "${INPUT_QUEUE_URL}" --attribute-names QueueArn \
+    --query Attributes.QueueArn --output text)"
+  EVENTS_QUEUE_URL="$(aws sqs get-queue-url --region "${AWS_REGION}" \
+    --queue-name "${EVENTS_QUEUE}" --query QueueUrl --output text)"
+  EVENTS_QUEUE_ARN="$(aws sqs get-queue-attributes --region "${AWS_REGION}" \
+    --queue-url "${EVENTS_QUEUE_URL}" --attribute-names QueueArn \
+    --query Attributes.QueueArn --output text)"
+  DLQ_URL="$(aws sqs get-queue-url --region "${AWS_REGION}" \
+    --queue-name "${DLQ}" --query QueueUrl --output text 2>/dev/null || echo '')"
+  if [[ -n "${DLQ_URL}" ]]; then
+    DLQ_ARN="$(aws sqs get-queue-attributes --region "${AWS_REGION}" \
+      --queue-url "${DLQ_URL}" --attribute-names QueueArn \
+      --query Attributes.QueueArn --output text)"
+  fi
+  export INPUT_QUEUE_URL INPUT_QUEUE_ARN EVENTS_QUEUE_URL EVENTS_QUEUE_ARN DLQ_URL DLQ_ARN
+}
+
+load_iam_state() {
+  if [[ -f "${STATE_DIR}/iam.env" ]]; then
+    # shellcheck disable=SC1091
+    source "${STATE_DIR}/iam.env"
+    return
+  fi
+  warn "No ${STATE_DIR}/iam.env — querying AWS for IAM role ARNs"
+  EXEC_ROLE_ARN="$(aws iam get-role --role-name "${EXEC_ROLE}" --query Role.Arn --output text)"
+  TASK_ROLE_ARN="$(aws iam get-role --role-name "${TASK_ROLE}" --query Role.Arn --output text)"
+  LAMBDA_ROLE_ARN="$(aws iam get-role --role-name "${LAMBDA_ROLE}" --query Role.Arn --output text)"
+  export EXEC_ROLE_ARN TASK_ROLE_ARN LAMBDA_ROLE_ARN
+}
+
+load_network_state() {
+  if [[ -f "${STATE_DIR}/network.env" ]]; then
+    # shellcheck disable=SC1091
+    source "${STATE_DIR}/network.env"
+    return
+  fi
+  warn "No ${STATE_DIR}/network.env — querying AWS for VPC / subnet / SG"
+  VPC_ID="$(aws ec2 describe-vpcs --region "${AWS_REGION}" \
+    --filters Name=isDefault,Values=true --query 'Vpcs[0].VpcId' --output text)"
+  SUBNET_IDS="$(aws ec2 describe-subnets --region "${AWS_REGION}" \
+    --filters "Name=vpc-id,Values=${VPC_ID}" \
+    --query 'Subnets[?MapPublicIpOnLaunch==`true`].SubnetId' --output text | tr '\t' ',')"
+  WORKER_SG_ID="$(aws ec2 describe-security-groups --region "${AWS_REGION}" \
+    --filters "Name=group-name,Values=${NS}-worker-sg" "Name=vpc-id,Values=${VPC_ID}" \
+    --query 'SecurityGroups[0].GroupId' --output text 2>/dev/null || echo '')"
+  export VPC_ID SUBNET_IDS WORKER_SG_ID
+}
+
+# Add ingress on PostgreSQL port from the UI task SG to whichever SG(s) the RDS
+# instance actually uses. Order: (1) active VpcSecurityGroups from
+# describe-db-instances — source of truth when the SG isn't named ${NS}-rds;
+# (2) fallback to EC2 filter group-name=${NS}-rds in the given VPC (pre-RDS deploy).
+authorize_ui_to_rds() {
+  local UI_SG="$1"
+  local VPC_ID="$2"
+  local sg_ids=()
+  local g out rc
+
+  local rds_sgs
+  rds_sgs="$(aws rds describe-db-instances --region "${AWS_REGION}" \
+    --db-instance-identifier "${RDS_ID}" \
+    --query 'DBInstances[0].VpcSecurityGroups[?Status==`active`].VpcSecurityGroupId' \
+    --output text 2>/dev/null || true)"
+  if [[ -n "${rds_sgs}" && "${rds_sgs}" != "None" ]]; then
+    for g in ${rds_sgs}; do
+      [[ -n "${g}" ]] && sg_ids+=("${g}")
+    done
+  fi
+
+  if [[ ${#sg_ids[@]} -eq 0 ]]; then
+    local by_name
+    by_name="$(aws ec2 describe-security-groups --region "${AWS_REGION}" \
+      --filters "Name=vpc-id,Values=${VPC_ID}" "Name=group-name,Values=${NS}-rds" \
+      --query 'SecurityGroups[0].GroupId' --output text 2>/dev/null || echo 'None')"
+    if [[ -n "${by_name}" && "${by_name}" != "None" ]]; then
+      sg_ids+=("${by_name}")
+    fi
+  fi
+
+  if [[ ${#sg_ids[@]} -eq 0 ]]; then
+    warn "Could not resolve RDS security groups (instance ${RDS_ID} not found or has no active SGs, and no ${NS}-rds in VPC ${VPC_ID}). Add ingress: ${UI_SG} → TCP 5432 on the DB security group(s)."
+    return 1
+  fi
+
+  for g in "${sg_ids[@]}"; do
+    out="$(aws ec2 authorize-security-group-ingress --region "${AWS_REGION}" \
+      --group-id "${g}" --protocol tcp --port 5432 \
+      --source-group "${UI_SG}" 2>&1)" && rc=0 || rc=$?
+    if (( rc == 0 )); then
+      ok "RDS SG ingress: ${UI_SG} → ${g}:5432"
+    elif echo "${out}" | grep -qiE 'already exists|Duplicate|InvalidPermission\.Duplicate'; then
+      ok "RDS SG ingress already present: ${UI_SG} → ${g}:5432"
+    else
+      warn "Could not add ${UI_SG} → ${g}:5432 — ${out}"
+    fi
+  done
+}
 
 phase_ecr() {
   log "Phase: ECR + image"
@@ -294,8 +418,7 @@ phase_logs() {
 
 phase_iam() {
   log "Phase: IAM roles"
-  # shellcheck disable=SC1091
-  source "${STATE_DIR}/sqs.env"
+  load_sqs_state
 
   assume_ecs='{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"Service":"ecs-tasks.amazonaws.com"},"Action":"sts:AssumeRole"}]}'
   assume_lambda='{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"Service":"lambda.amazonaws.com"},"Action":"sts:AssumeRole"}]}'
@@ -368,10 +491,8 @@ EOF
 
 phase_ecs() {
   log "Phase: ECS cluster + task definition"
-  # shellcheck disable=SC1091
-  source "${STATE_DIR}/iam.env"
-  # shellcheck disable=SC1091
-  source "${STATE_DIR}/sqs.env"
+  load_iam_state
+  load_sqs_state
 
   idempotent aws ecs create-cluster --region "${AWS_REGION}" --cluster-name "${CLUSTER}" >/dev/null
   ok "Cluster: ${CLUSTER}"
@@ -418,14 +539,53 @@ EOF
   ok "Task definition: ${TASK_FAMILY}:${REV}"
 }
 
+phase_image() {
+  # Rolling image refresh: clone the current task definition, swap the image
+  # URI, register a new revision. Zero dependency on .deploy-state/ or on
+  # whatever names the roles / queues / secrets happen to have — we inherit
+  # everything from the last-known-good revision that ECS itself has on file.
+  # `make deploy` remains the source of truth for env-var / IAM changes.
+  log "Phase: Register new task-def revision (image refresh)"
+
+  local cur="/tmp/deploy-taskdef-current.json"
+  local new="/tmp/deploy-taskdef.json"
+
+  if ! aws ecs describe-task-definition --region "${AWS_REGION}" \
+        --task-definition "${TASK_FAMILY}" \
+        --query 'taskDefinition' --output json > "${cur}" 2>/dev/null \
+     || [[ ! -s "${cur}" ]]; then
+    die "No task definition ${TASK_FAMILY} on file. Run 'make deploy' first, then 'make deploy-image' on subsequent code changes."
+  fi
+
+  python3 - "${cur}" "${new}" "${IMAGE_URI}" "${CONTAINER_NAME}" <<'PY'
+import json, sys
+in_path, out_path, new_image, container = sys.argv[1:5]
+with open(in_path) as f:
+    td = json.load(f)
+# AWS-managed fields that register-task-definition rejects
+for k in ("taskDefinitionArn","revision","status","requiresAttributes",
+         "compatibilities","registeredAt","registeredBy","deregisteredAt"):
+    td.pop(k, None)
+for c in td.get("containerDefinitions", []):
+    if c.get("name") == container:
+        c["image"] = new_image
+with open(out_path, "w") as f:
+    json.dump(td, f)
+PY
+
+  python3 -m json.tool "${new}" >/dev/null
+  REV="$(aws ecs register-task-definition --region "${AWS_REGION}" \
+    --cli-input-json file://"${new}" \
+    --query 'taskDefinition.revision' --output text)"
+  ok "Task definition: ${TASK_FAMILY}:${REV}"
+  ok "Image: ${IMAGE_URI}"
+}
+
 phase_lambda() {
   log "Phase: Lambda dispatcher"
-  # shellcheck disable=SC1091
-  source "${STATE_DIR}/network.env"
-  # shellcheck disable=SC1091
-  source "${STATE_DIR}/sqs.env"
-  # shellcheck disable=SC1091
-  source "${STATE_DIR}/iam.env"
+  load_network_state
+  load_sqs_state
+  load_iam_state
 
   (cd "${REPO_ROOT}/lambda" && zip -q -r /tmp/deploy-dispatcher.zip handler.py)
 
@@ -486,19 +646,7 @@ EOF
 
 phase_eventbridge() {
   log "Phase: EventBridge (S3 upload → input SQS)"
-  # Prefer the state file (fresh run), else re-derive from AWS so this phase
-  # can be run standalone on an already-deployed stack.
-  if [[ -f "${STATE_DIR}/sqs.env" ]]; then
-    # shellcheck disable=SC1091
-    source "${STATE_DIR}/sqs.env"
-  else
-    warn "No ${STATE_DIR}/sqs.env — querying AWS for queue URL/ARN"
-    INPUT_QUEUE_URL="$(aws sqs get-queue-url --region "${AWS_REGION}" \
-      --queue-name "${INPUT_QUEUE}" --query QueueUrl --output text)"
-    INPUT_QUEUE_ARN="$(aws sqs get-queue-attributes --region "${AWS_REGION}" \
-      --queue-url "${INPUT_QUEUE_URL}" --attribute-names QueueArn \
-      --query Attributes.QueueArn --output text)"
-  fi
+  load_sqs_state
 
   : "${UPLOAD_PREFIX:=uploads/}"
   local RULE_NAME="${NS}-s3-upload"
@@ -589,6 +737,254 @@ EOF
   ok "EventBridge target set → ${INPUT_QUEUE_ARN} (group=default, prefix=${UPLOAD_PREFIX})"
 }
 
+phase_ui() {
+  log "Phase: UI (Streamlit, public-IP Fargate)"
+
+  # ECS exec-role ARN: prefer what's already on the worker task def
+  # (handles stacks where IAM role names diverge from our naming scheme);
+  # fall back to IAM state + direct IAM lookup.
+  local EXEC_ROLE_ARN=""
+  EXEC_ROLE_ARN="$(aws ecs describe-task-definition --region "${AWS_REGION}" \
+    --task-definition "${TASK_FAMILY}" \
+    --query 'taskDefinition.executionRoleArn' --output text 2>/dev/null || echo '')"
+  if [[ -z "${EXEC_ROLE_ARN}" || "${EXEC_ROLE_ARN}" == "None" ]]; then
+    load_iam_state
+  fi
+  if [[ -z "${EXEC_ROLE_ARN:-}" || "${EXEC_ROLE_ARN}" == "None" ]]; then
+    die "Could not resolve ECS execution role ARN. Run 'make deploy' first to create the base stack."
+  fi
+
+  # ── 1. ECR repo + build + push UI image ───────────────────────────────────
+  idempotent aws ecr create-repository --region "${AWS_REGION}" \
+    --repository-name "${UI_ECR_REPO}" \
+    --image-scanning-configuration scanOnPush=true >/dev/null
+  ok "ECR repo: ${UI_ECR_REPO}"
+
+  aws ecr get-login-password --region "${AWS_REGION}" | \
+    docker login --username AWS --password-stdin \
+    "${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com" >/dev/null
+
+  docker build --platform linux/amd64 -t "${UI_ECR_REPO}:latest" "${REPO_ROOT}/ui"
+  docker tag  "${UI_ECR_REPO}:latest" "${UI_IMAGE_URI}"
+  docker push "${UI_IMAGE_URI}"
+  ok "Pushed ${UI_IMAGE_URI}"
+
+  # ── 2. Network (VPC + subnets + UI security group) ────────────────────────
+  local VPC_ID SUBNETS UI_SG
+  VPC_ID="$(aws ec2 describe-vpcs --region "${AWS_REGION}" \
+    --filters Name=isDefault,Values=true --query 'Vpcs[0].VpcId' --output text)"
+  SUBNETS="$(aws ec2 describe-subnets --region "${AWS_REGION}" \
+    --filters Name=vpc-id,Values="${VPC_ID}" Name=default-for-az,Values=true \
+    --query 'Subnets[].SubnetId' --output text | tr '\t' ',')"
+
+  UI_SG="$(aws ec2 describe-security-groups --region "${AWS_REGION}" \
+    --filters Name=vpc-id,Values="${VPC_ID}" Name=group-name,Values="${UI_SG_NAME}" \
+    --query 'SecurityGroups[0].GroupId' --output text 2>/dev/null || echo 'None')"
+  if [[ "${UI_SG}" == "None" ]]; then
+    UI_SG="$(aws ec2 create-security-group --region "${AWS_REGION}" --vpc-id "${VPC_ID}" \
+      --group-name "${UI_SG_NAME}" --description "${NS} Streamlit UI" \
+      --query GroupId --output text)"
+  fi
+  aws ec2 authorize-security-group-ingress --region "${AWS_REGION}" \
+    --group-id "${UI_SG}" --protocol tcp --port "${UI_PORT}" \
+    --cidr 0.0.0.0/0 >/dev/null 2>&1 || true
+  ok "UI SG: ${UI_SG} (ingress 0.0.0.0/0:${UI_PORT})"
+
+  authorize_ui_to_rds "${UI_SG}" "${VPC_ID}"
+
+  # ── 3. UI task role (S3 upload + presign, RDS secret, logs) ───────────────
+  local assume_ecs='{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"Service":"ecs-tasks.amazonaws.com"},"Action":"sts:AssumeRole"}]}'
+  idempotent aws iam create-role --role-name "${UI_TASK_ROLE}" \
+    --assume-role-policy-document "${assume_ecs}" >/dev/null
+
+  cat > /tmp/deploy-ui-task-policy.json <<EOF
+{
+  "Version":"2012-10-17",
+  "Statement":[
+    {"Sid":"UploadToS3","Effect":"Allow","Action":["s3:PutObject","s3:PutObjectTagging"],"Resource":"arn:aws:s3:::${S3_BUCKET}/uploads/*"},
+    {"Sid":"PresignFromS3","Effect":"Allow","Action":["s3:GetObject"],"Resource":"arn:aws:s3:::${S3_BUCKET}/*"},
+    {"Sid":"ListBucket","Effect":"Allow","Action":["s3:ListBucket"],"Resource":"arn:aws:s3:::${S3_BUCKET}"},
+    {"Sid":"ReadRdsSecret","Effect":"Allow","Action":["secretsmanager:GetSecretValue"],"Resource":"arn:aws:secretsmanager:${AWS_REGION}:${AWS_ACCOUNT_ID}:secret:${RDS_SECRET_NAME}-*"},
+    {"Sid":"WriteLogs","Effect":"Allow","Action":["logs:CreateLogStream","logs:PutLogEvents"],"Resource":"arn:aws:logs:${AWS_REGION}:${AWS_ACCOUNT_ID}:log-group:${UI_LOG_GROUP}:*"}
+  ]
+}
+EOF
+  python3 -m json.tool /tmp/deploy-ui-task-policy.json >/dev/null
+  aws iam put-role-policy --role-name "${UI_TASK_ROLE}" \
+    --policy-name inline --policy-document file:///tmp/deploy-ui-task-policy.json
+  local UI_TASK_ROLE_ARN
+  UI_TASK_ROLE_ARN="$(aws iam get-role --role-name "${UI_TASK_ROLE}" --query Role.Arn --output text)"
+  ok "UI task role: ${UI_TASK_ROLE_ARN}"
+
+  # IAM eventual-consistency — ECS will 400 on fresh roles otherwise.
+  sleep 8
+
+  # ── 4. Log group ──────────────────────────────────────────────────────────
+  idempotent aws logs create-log-group --region "${AWS_REGION}" \
+    --log-group-name "${UI_LOG_GROUP}" >/dev/null
+  ok "Log group: ${UI_LOG_GROUP}"
+
+  # ── 5. Cluster (reuse worker cluster; create if phase_ecs hasn't run) ─────
+  if ! aws ecs describe-clusters --region "${AWS_REGION}" --clusters "${CLUSTER}" \
+       --query 'clusters[0].status' --output text 2>/dev/null | grep -q ACTIVE; then
+    idempotent aws ecs create-cluster --region "${AWS_REGION}" --cluster-name "${CLUSTER}" >/dev/null
+    ok "Cluster: ${CLUSTER}"
+  fi
+
+  # ── 6. Task definition ────────────────────────────────────────────────────
+  cat > /tmp/deploy-ui-taskdef.json <<EOF
+{
+  "family":"${UI_TASK_FAMILY}",
+  "networkMode":"awsvpc",
+  "requiresCompatibilities":["FARGATE"],
+  "cpu":"1024",
+  "memory":"2048",
+  "executionRoleArn":"${EXEC_ROLE_ARN}",
+  "taskRoleArn":"${UI_TASK_ROLE_ARN}",
+  "containerDefinitions":[{
+    "name":"${UI_CONTAINER_NAME}",
+    "image":"${UI_IMAGE_URI}",
+    "essential":true,
+    "portMappings":[{"containerPort":${UI_PORT},"protocol":"tcp"}],
+    "environment":[
+      {"name":"AWS_REGION","value":"${AWS_REGION}"},
+      {"name":"RDS_SECRET_NAME","value":"${RDS_SECRET_NAME}"},
+      {"name":"S3_PROCESSED_BUCKET","value":"${S3_BUCKET}"}
+    ],
+    "logConfiguration":{
+      "logDriver":"awslogs",
+      "options":{
+        "awslogs-group":"${UI_LOG_GROUP}",
+        "awslogs-region":"${AWS_REGION}",
+        "awslogs-stream-prefix":"ui"
+      }
+    }
+  }]
+}
+EOF
+  python3 -m json.tool /tmp/deploy-ui-taskdef.json >/dev/null
+  local UI_REV
+  UI_REV="$(aws ecs register-task-definition --region "${AWS_REGION}" \
+    --cli-input-json file:///tmp/deploy-ui-taskdef.json \
+    --query 'taskDefinition.revision' --output text)"
+  ok "UI task definition: ${UI_TASK_FAMILY}:${UI_REV}"
+
+  # ── 7. ECS service (public IP, single task by default) ────────────────────
+  local net_cfg
+  net_cfg="awsvpcConfiguration={subnets=[${SUBNETS//,/,}],securityGroups=[${UI_SG}],assignPublicIp=ENABLED}"
+
+  if aws ecs describe-services --region "${AWS_REGION}" --cluster "${CLUSTER}" \
+       --services "${UI_SERVICE}" --query 'services[0].status' --output text 2>/dev/null \
+     | grep -q ACTIVE; then
+    aws ecs update-service --region "${AWS_REGION}" --cluster "${CLUSTER}" \
+      --service "${UI_SERVICE}" \
+      --task-definition "${UI_TASK_FAMILY}:${UI_REV}" \
+      --force-new-deployment >/dev/null
+    ok "Updated ECS service: ${UI_SERVICE} → ${UI_TASK_FAMILY}:${UI_REV}"
+  else
+    aws ecs create-service --region "${AWS_REGION}" --cluster "${CLUSTER}" \
+      --service-name "${UI_SERVICE}" \
+      --task-definition "${UI_TASK_FAMILY}:${UI_REV}" \
+      --desired-count 1 --launch-type FARGATE \
+      --network-configuration "${net_cfg}" >/dev/null
+    ok "Created ECS service: ${UI_SERVICE}"
+  fi
+
+  # ── 8. Wait for RUNNING task + print public IP ────────────────────────────
+  ok "Waiting for task to start (first deploy typically takes 1–2 min)…"
+  local TASK_ARN="" ENI_ID PUBLIC_IP
+  for _ in $(seq 1 30); do
+    TASK_ARN="$(aws ecs list-tasks --region "${AWS_REGION}" --cluster "${CLUSTER}" \
+      --service-name "${UI_SERVICE}" --desired-status RUNNING \
+      --query 'taskArns[0]' --output text 2>/dev/null || echo '')"
+    [[ -n "${TASK_ARN}" && "${TASK_ARN}" != "None" ]] && break
+    sleep 5
+  done
+  if [[ -z "${TASK_ARN}" || "${TASK_ARN}" == "None" ]]; then
+    warn "No RUNNING UI task yet. Check CloudWatch logs: aws logs tail ${UI_LOG_GROUP} --follow"
+    return 0
+  fi
+  ENI_ID="$(aws ecs describe-tasks --region "${AWS_REGION}" --cluster "${CLUSTER}" \
+    --tasks "${TASK_ARN}" \
+    --query 'tasks[0].attachments[0].details[?name==`networkInterfaceId`].value | [0]' \
+    --output text)"
+  PUBLIC_IP="$(aws ec2 describe-network-interfaces --region "${AWS_REGION}" \
+    --network-interface-ids "${ENI_ID}" \
+    --query 'NetworkInterfaces[0].Association.PublicIp' --output text 2>/dev/null || echo '')"
+  if [[ -n "${PUBLIC_IP}" && "${PUBLIC_IP}" != "None" ]]; then
+    printf '\n  \033[1;32m✓ UI URL: http://%s:%d\033[0m\n\n' "${PUBLIC_IP}" "${UI_PORT}"
+  else
+    warn "Public IP not ready yet. Re-run 'make ui-ip' in ~30s."
+  fi
+}
+
+phase_ui_image() {
+  log "Phase: UI image refresh (rolling deploy on ECS service)"
+
+  aws ecr get-login-password --region "${AWS_REGION}" | \
+    docker login --username AWS --password-stdin \
+    "${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com" >/dev/null
+  docker build --platform linux/amd64 -t "${UI_ECR_REPO}:latest" "${REPO_ROOT}/ui"
+  docker tag  "${UI_ECR_REPO}:latest" "${UI_IMAGE_URI}"
+  docker push "${UI_IMAGE_URI}"
+  ok "Pushed ${UI_IMAGE_URI}"
+
+  local cur="/tmp/deploy-ui-taskdef-current.json"
+  local new="/tmp/deploy-ui-taskdef.json"
+  if ! aws ecs describe-task-definition --region "${AWS_REGION}" \
+        --task-definition "${UI_TASK_FAMILY}" \
+        --query 'taskDefinition' --output json > "${cur}" 2>/dev/null \
+     || [[ ! -s "${cur}" ]]; then
+    die "No UI task definition on file. Run 'make deploy-ui' first."
+  fi
+
+  python3 - "${cur}" "${new}" "${UI_IMAGE_URI}" "${UI_CONTAINER_NAME}" <<'PY'
+import json, sys
+in_path, out_path, new_image, container = sys.argv[1:5]
+with open(in_path) as f:
+    td = json.load(f)
+for k in ("taskDefinitionArn","revision","status","requiresAttributes",
+         "compatibilities","registeredAt","registeredBy","deregisteredAt"):
+    td.pop(k, None)
+for c in td.get("containerDefinitions", []):
+    if c.get("name") == container:
+        c["image"] = new_image
+with open(out_path, "w") as f:
+    json.dump(td, f)
+PY
+  python3 -m json.tool "${new}" >/dev/null
+  local UI_REV
+  UI_REV="$(aws ecs register-task-definition --region "${AWS_REGION}" \
+    --cli-input-json file://"${new}" \
+    --query 'taskDefinition.revision' --output text)"
+  ok "UI task definition: ${UI_TASK_FAMILY}:${UI_REV}"
+
+  aws ecs update-service --region "${AWS_REGION}" --cluster "${CLUSTER}" \
+    --service "${UI_SERVICE}" \
+    --task-definition "${UI_TASK_FAMILY}:${UI_REV}" \
+    --force-new-deployment >/dev/null
+  ok "Rolling out new revision to service ${UI_SERVICE}"
+}
+
+phase_ui_ip() {
+  local TASK_ARN ENI_ID PUBLIC_IP
+  TASK_ARN="$(aws ecs list-tasks --region "${AWS_REGION}" --cluster "${CLUSTER}" \
+    --service-name "${UI_SERVICE}" --desired-status RUNNING \
+    --query 'taskArns[0]' --output text 2>/dev/null || echo '')"
+  if [[ -z "${TASK_ARN}" || "${TASK_ARN}" == "None" ]]; then
+    die "No RUNNING UI task in cluster ${CLUSTER} / service ${UI_SERVICE}"
+  fi
+  ENI_ID="$(aws ecs describe-tasks --region "${AWS_REGION}" --cluster "${CLUSTER}" \
+    --tasks "${TASK_ARN}" \
+    --query 'tasks[0].attachments[0].details[?name==`networkInterfaceId`].value | [0]' \
+    --output text)"
+  PUBLIC_IP="$(aws ec2 describe-network-interfaces --region "${AWS_REGION}" \
+    --network-interface-ids "${ENI_ID}" \
+    --query 'NetworkInterfaces[0].Association.PublicIp' --output text 2>/dev/null || echo '')"
+  [[ -z "${PUBLIC_IP}" || "${PUBLIC_IP}" == "None" ]] && die "Task has no public IP yet."
+  echo "http://${PUBLIC_IP}:${UI_PORT}"
+}
+
 phase_dashboard() {
   log "Phase: CloudWatch dashboard"
   DASHBOARD_NAME="${DASHBOARD_NAME}" \
@@ -626,6 +1022,12 @@ phase_summary() {
   Dashboard:
     https://${AWS_REGION}.console.aws.amazon.com/cloudwatch/home?region=${AWS_REGION}#dashboards:name=${DASHBOARD_NAME}
 
+  UI (Streamlit):
+    make deploy-ui          # first-time deploy (builds image, creates SG/IAM/task-def/service, prints URL)
+    make deploy-ui-image    # rolling image refresh for code changes only
+    make ui-ip              # print current UI public IP (rotates on task replacement)
+    aws logs tail ${UI_LOG_GROUP} --region ${AWS_REGION} --follow
+
 EOF
 }
 
@@ -642,7 +1044,10 @@ case "${PHASE}" in
   lambda)    phase_lambda ;;
   eventbridge) phase_eventbridge ;;
   dashboard) phase_dashboard ;;
-  image)     phase_ecr ; phase_ecs ;;  # rebuild + register new task def revision
+  image)     phase_ecr ; phase_image ;;  # rebuild + inherit current task def, swap image only
+  ui)        phase_ui ;;
+  ui-image)  phase_ui_image ;;
+  ui-ip)     phase_ui_ip ;;
   all)
     phase_network
     phase_storage

@@ -27,6 +27,7 @@ from dataclasses import dataclass
 from tenacity import retry, stop_after_attempt, wait_exponential, before_sleep_log
 
 from .config import DEFAULT_TARGET_LANGUAGES, get_sarvam_api_key
+from .lang_detect import detect_source_code
 from .merger import MergedSegment
 from .rate_limit import throttle
 
@@ -36,6 +37,20 @@ _MAX_CHARS_PER_BATCH = 900   # under Mayura's 1000-char limit
 _MAX_SEGS_PER_BATCH = 10     # hard cap; ⟦S⟧ separator is preserved so large batches are safe
 MAX_TRANSLATION_WORKERS = 10
 _SEP = " ⟦S⟧ "  # Unicode angle-bracket marker — preserved by Mayura, never in Indic speech
+
+# Any non-ASCII character short-circuits the "already English" fast-path: the
+# segment has to contain *zero* non-ASCII bytes to skip Mayura. This is the
+# cheapest, lowest-risk heuristic — Hinglish in Latin script still goes
+# through Mayura (it really does need translation), but a fully-English
+# segment is copied source→translation with no API call.
+_NON_ASCII_RE = re.compile(r"[^\x00-\x7F]")
+
+
+def _is_effectively_english(text: str) -> bool:
+    t = (text or "").strip()
+    if not t:
+        return True
+    return _NON_ASCII_RE.search(t) is None
 
 # Indic script → Mayura v1 source code. Order preserved so Devanagari wins
 # when a line mixes Devanagari with other scripts (rare but possible).
@@ -247,24 +262,40 @@ def _translate_batch(
 
 def _en_passthrough_retry_source(source: str, translated: str) -> str | None:
     """
-    If the en-IN output looks untranslated, return the Mayura source code to retry with.
-    Covers any Indic script (Hindi, Bengali, Punjabi, Gujarati, Oriya, Tamil, Telugu,
-    Kannada, Malayalam). Returns None when the output looks fine.
+    Decide whether to retry an en-IN segment and, if so, which Mayura source
+    code to use.
+
+    Entry gate (always byte-level, never semantic): the segment only qualifies
+    for retry when Mayura's output still looks untranslated — i.e. the output
+    still contains Indic script, or it's a byte-for-byte copy of an Indic-
+    script source. That guard is cheap and trustworthy.
+
+    Code selection: once a retry is warranted, the *source text* is the only
+    reliable signal (the output is, by definition, the failed attempt). We ask
+    `lang_detect.detect_source_code(src)` first — it disambiguates languages
+    sharing a script (most importantly Hindi vs Marathi, both Devanagari).
+    On low confidence / very short text / lingua unavailable, we fall back to
+    `_detect_indic_source(src)` (the script-range regex), then as a last
+    resort `_detect_indic_source(out)`.
     """
     src = (source or "").strip()
     out = (translated or "").strip()
     if not src or not out:
         return None
 
-    # Case 1: the English output still contains Indic script → retry with that script's source.
-    code_from_output = _detect_indic_source(out)
-    if code_from_output:
-        return code_from_output
+    # Case 1: the English output still contains Indic script → retry.
+    if _detect_indic_source(out):
+        return (
+            detect_source_code(src)
+            or _detect_indic_source(src)
+            or _detect_indic_source(out)
+        )
 
-    # Case 2: the output is byte-for-byte the source (and long enough to be meaningful)
-    # AND the source contains Indic script — pure-English repeats don't need a retry.
-    if len(src) >= 15 and src == out:
-        return _detect_indic_source(src)
+    # Case 2: the output is byte-for-byte the source (and long enough to be
+    # meaningful) AND the source contains Indic script — pure-English
+    # repeats don't need a retry.
+    if len(src) >= 15 and src == out and _detect_indic_source(src):
+        return detect_source_code(src) or _detect_indic_source(src)
 
     return None
 
@@ -361,27 +392,55 @@ def translate_segments(
         return {}
 
     client = _sarvam_client()
+    # Default/global batches reused for non-English targets.
     batches = _build_batches(segments)
     results: dict[str, list[TranslatedSegment]] = {}
 
     for lang in langs:
-        logger.info(
-            "Translating %d segments in %d batches → %s (workers=%d)",
-            len(segments), len(batches), lang, MAX_TRANSLATION_WORKERS,
-        )
-
         seg_results: dict[int, TranslatedSegment] = {}
 
-        with ThreadPoolExecutor(max_workers=MAX_TRANSLATION_WORKERS) as executor:
-            futures = {
-                executor.submit(_translate_batch, client, batch, lang): batch
-                for batch in batches
-            }
-            for future in as_completed(futures):
-                for ts in future.result():
-                    seg_results[ts.segment_index] = ts
+        # Fast-path: when the target is English, any segment that is ASCII-only
+        # is assumed already-English and copied source → translation with no
+        # Mayura call. Saves ~100% of cost for English-heavy sessions.
+        if lang == "en-IN":
+            pass_segs = [s for s in segments if _is_effectively_english(s.text)]
+            translate_segs = [s for s in segments if not _is_effectively_english(s.text)]
+            for s in pass_segs:
+                seg_results[s.segment_index] = TranslatedSegment(
+                    segment_index=s.segment_index,
+                    translated_text=s.text.strip(),
+                )
+            lang_batches = _build_batches(translate_segs) if translate_segs else []
+            logger.info(
+                "Translating → %s: %d segments (%d English passthrough, "
+                "%d to Mayura in %d batches; workers=%d)",
+                lang, len(segments), len(pass_segs), len(translate_segs),
+                len(lang_batches), MAX_TRANSLATION_WORKERS,
+            )
+        else:
+            lang_batches = batches
+            logger.info(
+                "Translating %d segments in %d batches → %s (workers=%d)",
+                len(segments), len(lang_batches), lang, MAX_TRANSLATION_WORKERS,
+            )
 
-        ordered = [seg_results[seg.segment_index] for seg in segments]
+        if lang_batches:
+            with ThreadPoolExecutor(max_workers=MAX_TRANSLATION_WORKERS) as executor:
+                futures = {
+                    executor.submit(_translate_batch, client, batch, lang): batch
+                    for batch in lang_batches
+                }
+                for future in as_completed(futures):
+                    for ts in future.result():
+                        seg_results[ts.segment_index] = ts
+
+        ordered = [
+            seg_results.get(
+                seg.segment_index,
+                TranslatedSegment(segment_index=seg.segment_index, translated_text=""),
+            )
+            for seg in segments
+        ]
         if lang == "en-IN":
             ordered = _retry_en_passthroughs(client, segments, ordered)
         results[lang] = ordered

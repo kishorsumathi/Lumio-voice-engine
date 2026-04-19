@@ -31,7 +31,7 @@ from .events import publish_job_event
 from .job_status import create_job, mark_failed, store_results, update_status
 from .merger import merge
 from .metrics import emit_job_outcome, emit_translation_coverage
-from .s3 import download_audio
+from .s3 import download_audio, get_object_metadata
 from .transcription import transcribe_all_chunks
 from .translation import translate_segments
 
@@ -146,6 +146,20 @@ def process_job(
             update_status(job_id, "downloading")
             log.info("Downloading audio")
             audio_path = download_audio(s3_bucket, s3_key, work_dir)
+
+            # Per-upload target languages override via S3 object metadata
+            # (set by the Streamlit UI on PutObject). Keeps EventBridge → SQS
+            # flow unchanged: no schema changes to the input message body.
+            meta = get_object_metadata(s3_bucket, s3_key)
+            meta_langs_raw = meta.get("target-languages") or meta.get("Target-Languages")
+            if meta_langs_raw:
+                meta_langs = [x.strip() for x in meta_langs_raw.split(",") if x.strip()]
+                if meta_langs:
+                    log.info(
+                        "Target languages from S3 metadata override env: %s",
+                        meta_langs,
+                    )
+                    target_languages = meta_langs
 
             # ── 2. Validate + prepare ────────────────────────────────────
             audio_path = ensure_audio_only(audio_path, work_dir)
