@@ -1,111 +1,123 @@
-# Lumio
+# Anchor Voice
 
-Audio transcription application with speaker diarization, real-time live transcription, and a shared audio library. Built with Streamlit and powered by Deepgram's speech-to-text API.
+Event-driven AWS pipeline for transcribing and translating long-form audio — medical sessions, therapy recordings, interviews — using Sarvam Saaras v3 with cross-chunk speaker diarization.
 
-## Features
+## Architecture
 
-- **Upload & Transcribe** — Upload audio files (WAV, MP3, M4A, FLAC, etc.) of any length and get speaker-diarized transcriptions. Edit speaker labels (e.g., "Speaker 0" → "Kishor") and changes reflect across the entire transcript. Download transcripts as `.txt`.
+```
+S3 upload → EventBridge → SQS FIFO → Lambda → ECS Fargate
+                                                    │
+                                        ┌───────────┴────────────────┐
+                                        │  Pipeline                  │
+                                        │  1. VAD chunking           │
+                                        │  2. Transcription ─────────┼──► Sarvam Saaras v3
+                                        │  3. Speaker stitching      │
+                                        │  4. Batched translation ───┼──► Sarvam Mayura v1
+                                        │     + Indic-passthrough    │
+                                        │       retry (en-IN)        │
+                                        │  5. Store ─────────────────┼──► RDS PostgreSQL
+                                        │  6. Publish completion ────┼──► SQS job-events queue
+                                        └────────────────────────────┘
+```
 
-- **Live Transcription** — Real-time speech-to-text directly from your browser microphone. Audio streams via WebSocket to Deepgram with a live waveform visualizer. Text appears as you speak.
+Full architecture, pipeline stages, error handling, and edge cases: **[docs/architecture.md](docs/architecture.md)**
 
-- **Audio Library** — Save uploaded audio files with a subject/description to a shared library. Browse, play, and transcribe any file from the library.
+## Prerequisites
 
-- **Model Selection** — Choose between transcription models (Deepgram Nova-3, Nova-2) from the sidebar. Additional models (OpenAI Whisper) are listed as coming soon.
+- `uv` Python package manager (`brew install uv`)
+- `ffmpeg` (`brew install ffmpeg`)
+- Docker Desktop
+- AWS CLI configured (`aws configure`)
+- Sarvam API key ([sarvam.ai](https://sarvam.ai))
+
+## Local Development
+
+```bash
+cp .env.example .env
+# Fill in: SARVAM_API_KEY, DATABASE_URL
+
+cd worker && uv sync && cd ..
+make db-up
+make init-db
+
+DATABASE_URL=postgresql://anchorvoice:anchorvoice@localhost:5432/anchorvoice \
+  uv run python scripts/run_local.py /path/to/audio.mp3 --languages en
+```
+
+## Deploy to AWS
+
+AWS resources are set up manually. The worker runs as an ECS Fargate task triggered by S3 uploads via EventBridge → SQS → Lambda.
+
+```bash
+# After creating your ECR repo, RDS, S3 bucket, SQS queue, and ECS cluster manually:
+
+# Store Sarvam API key
+aws secretsmanager create-secret \
+  --name anchor-voice/sarvam-api-key \
+  --secret-string "YOUR_SARVAM_KEY"
+
+# Build and push worker image
+make worker-push    # requires ECR repo already created
+
+# Create tables on RDS (idempotent, safe to re-run)
+DATABASE_URL='postgresql+psycopg2://USER:PASS@HOST:5432/DBNAME' \
+  uv run python scripts/init_db.py
+```
+
+See [docs/architecture.md](docs/architecture.md) for the full AWS resource list and wiring.
 
 ## Project Structure
 
 ```
-Lumio-voice/
-├── app.py                                  # Streamlit entry point
-├── src/
-│   └── anchor_voice/
-│       ├── config.py                       # Settings, API keys, model registry
-│       ├── transcription.py                # Deepgram client, transcribe, diarization
-│       ├── library.py                      # Audio library CRUD (file storage + JSON index)
-│       └── components/
-│           ├── transcript.py               # Speaker editor, transcript renderer, download
-│           └── live_transcription.py       # Browser-side JS for real-time mic streaming
-├── data/
-│   └── audio_library/                      # Stored audio files + index.json (gitignored)
-├── .streamlit/
-│   └── config.toml                         # Streamlit config (5GB upload limit)
-├── .env                                    # DEEPGRAM_API_KEY (not committed)
-├── pyproject.toml                          # Project metadata & dependencies (uv)
-└── uv.lock                                # Locked dependencies
+├── lambda/
+│   └── handler.py           # SQS → ECS RunTask dispatcher (deploy manually)
+├── worker/                  # ECS Fargate container
+│   ├── Dockerfile
+│   ├── pyproject.toml
+│   └── src/pipeline/
+│       ├── main.py          # Orchestrator + SQS heartbeat
+│       ├── config.py        # All env vars + Secrets Manager
+│       ├── audio.py         # Duration detection, format conversion
+│       ├── chunking.py      # VAD-based smart splitting with overlap
+│       ├── transcription.py # Sarvam batch API, parallel chunks
+│       ├── merger.py        # Cross-chunk speaker stitching
+│       ├── translation.py   # Batched parallel translation + en-IN Indic-passthrough retry
+│       ├── events.py        # Publish job.completed / job.failed to SQS events queue
+│       ├── rate_limit.py    # Shared 100 RPM sliding-window limiter
+│       ├── models.py        # SQLAlchemy ORM
+│       ├── db.py            # Session factory
+│       └── job_status.py    # Status state machine + DB writes
+├── scripts/
+│   ├── init_db.py           # Idempotent schema bootstrap (SQLAlchemy create_all)
+│   └── run_local.py         # Local pipeline runner (no AWS needed)
+├── docs/
+│   └── architecture.md      # Full architecture + edge case reference
+└── Makefile
 ```
 
-## Setup
+## Database Schema
 
-### Prerequisites
+Three tables: `jobs`, `segments`, `translations`.
 
-- Python 3.13+
-- [uv](https://docs.astral.sh/uv/) package manager
-- [Deepgram API key](https://console.deepgram.com/)
+```sql
+SELECT id, status, audio_duration_seconds, num_speakers, started_at
+FROM jobs ORDER BY started_at DESC;
 
-### Installation
+SELECT speaker_id, start_time, end_time, text
+FROM segments WHERE job_id = '...' ORDER BY start_time;
 
-```bash
-# Clone the repository
-git clone <repo-url>
-cd anchor-voice
-
-# Install dependencies
-uv sync
-
-# Configure environment
-cp .env.example .env
-# Edit .env and add your Deepgram API key
+SELECT s.text, t.translated_text
+FROM segments s JOIN translations t ON t.segment_id = s.id
+WHERE t.target_language = 'en-IN' AND s.job_id = '...';
 ```
 
-### Environment Variables
+## Key Design Decisions
 
-Create a `.env` file in the project root:
-
-```
-DEEPGRAM_API_KEY=your_deepgram_api_key_here
-```
-
-### Run
-
-```bash
-uv run streamlit run app.py
-```
-
-The app will open at `http://localhost:8501`.
-
-## Architecture
-
-### Two Transcription Paths
-
-| Feature | Upload / Library | Live Transcription |
-|---|---|---|
-| **API** | Deepgram REST (`POST /v1/listen`) | Deepgram WebSocket (`wss://api.deepgram.com/v1/listen`) |
-| **Runs on** | Python (server-side) | JavaScript (browser-side) |
-| **Diarization** | Yes (full speaker separation) | No (single-speaker captioning) |
-| **Speaker editing** | Yes | No |
-| **Audio source** | Uploaded file | Browser microphone |
-
-### Why Browser-Side for Live?
-
-Streamlit reruns the entire Python script on every UI interaction. A Python-based WebSocket would get killed on each rerun. The live transcription runs entirely in JavaScript inside an embedded HTML component (`st.components.v1.html`), keeping the WebSocket connection alive independently of Streamlit's lifecycle.
-
-### Audio Library Storage
-
-Files are stored on disk in `data/audio_library/` with metadata tracked in `index.json`. This is a simple file-based approach — no database required.
-
-## Supported Audio Formats
-
-WAV, MP3, M4A, FLAC, OGG, WMA, AAC, WebM, MP4
-
-## Adding New Models
-
-Edit `MODELS` in `src/anchor_voice/config.py`:
-
-```python
-MODELS = {
-    "Deepgram Nova-3": {"provider": "deepgram", "model": "nova-3", "available": True},
-    "Your New Model": {"provider": "provider", "model": "model-id", "available": True},
-}
-```
-
-Set `"available": False` to list a model as "Coming Soon" (disables transcription buttons).
+- **No pyannote / no diarization model** — Sarvam provides per-chunk diarization; overlap text matching stitches speaker IDs across chunks
+- **No NAT gateway** — ECS in public subnets saves ~$32/month; RDS in isolated subnets
+- **Sarvam-only** — transcription, diarization, and translation all via Sarvam APIs
+- **100 RPM shared** — single sliding-window rate limiter across all Sarvam calls
+- **Sessions ≤ 60 min** — single chunk, no splitting or stitching needed (covers most medical sessions)
+- **Translation batching** — up to 10 segments / 900 chars per Mayura call (delimiter `⟦S⟧`); ~10× fewer API calls than per-segment translation
+- **Indic-passthrough repair** — for `en-IN` targets, segments where Mayura auto-detect returns the Hinglish input unchanged are re-translated with the explicit detected Indic source (`hi/bn/pa/gu/od/ta/te/kn/ml-IN`). See [docs/architecture.md](docs/architecture.md#en-in-indic-passthrough-retry-pass).
+- **Completion events via SQS** — on finish (success or failure) the worker publishes one self-contained SQS message (`job.completed` / `job.failed`) to `JOB_EVENTS_QUEUE_URL`. Your API backend / frontend consumes it instead of polling RDS. Schema + consumer sketch in [docs/architecture.md](docs/architecture.md#stage-7--completion-event-fan-out-notification).

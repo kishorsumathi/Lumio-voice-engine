@@ -1,24 +1,60 @@
-# Python-generated files
+# ── Python ────────────────────────────────────────────────────────────────────
 __pycache__/
-*.py[oc]
-build/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg-info/
 dist/
+build/
 wheels/
-*.egg-info
+*.egg
 
-# Virtual environments
-.venv
+# ── Virtual environments ───────────────────────────────────────────────────────
+.venv/
+venv/
+env/
 
-# Environment
+# ── Environment / secrets ──────────────────────────────────────────────────────
 .env
+*.env.local
+
+# ── Audio / test files (large, not for version control) ──────────────────────
+*.mp3
+*.mp4
+*.m4a
+*.wav
+*.flac
+*.ogg
+*.aac
+*.webm
+*.mpeg
+
+# ── Model caches (large, not for version control) ─────────────────────────────
+.cache/
+worker/.cache/
+**/.cache/torch/
+**/.cache/huggingface/
+
+# ── OS ────────────────────────────────────────────────────────────────────────
 .DS_Store
-# Audio library data (user uploads)
-data/audio_library/*.mp3
-data/audio_library/*.wav
-data/audio_library/*.m4a
-data/audio_library/*.flac
-data/audio_library/*.ogg
-data/audio_library/*.aac
-data/audio_library/*.webm
-data/audio_library/*.mp4
-data/audio_library/index.json
+Thumbs.db
+
+# ── IDE ───────────────────────────────────────────────────────────────────────
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# ── Test / coverage ───────────────────────────────────────────────────────────
+.pytest_cache/
+.coverage
+htmlcov/
+.mypy_cache/
+.ruff_cache/
+**/.ruff_cache/
+
+# ── Pipeline run artifacts ────────────────────────────────────────────────────
+# Transcript / translation sidecar files written by scripts/run_local.py
+*_transcript.txt
+*_translation_*.txt

@@ -12,7 +12,8 @@
       "WebSearch",
       "Read(//c/Users/Dell/.claude/**)",
       "Read(//c/Users/Dell/.claude/projects/C--Users-Dell/**)",
-      "Bash(cat ~/.claude/hooks/*.json)"
+      "Bash(cat ~/.claude/hooks/*.json)",
+      "Bash(DATABASE_URL=postgresql://anchorvoice:anchorvoice@localhost:5432/anchorvoice uv run *)"
     ]
   },
   "enabledMcpjsonServers": [
