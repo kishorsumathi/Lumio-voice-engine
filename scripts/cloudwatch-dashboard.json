@@ -1,0 +1,184 @@
+{
+  "widgets": [
+    {
+      "type": "text",
+      "x": 0, "y": 0, "width": 24, "height": 1,
+      "properties": {
+        "markdown": "# Anchor Voice — Pipeline Health\nMetrics emitted by the worker via EMF to CloudWatch Logs → auto-extracted under the **AnchorVoice** namespace."
+      }
+    },
+
+    {
+      "type": "metric",
+      "x": 0, "y": 1, "width": 8, "height": 6,
+      "properties": {
+        "title": "Jobs: completed vs failed (per 5 min)",
+        "view": "timeSeries",
+        "stacked": false,
+        "region": "__REGION__",
+        "stat": "Sum",
+        "period": 300,
+        "metrics": [
+          [ "AnchorVoice", "JobCompleted", "Service", "worker", { "label": "Completed", "color": "#2ca02c" } ],
+          [ ".",           "JobFailed",    ".",         ".",      { "label": "Failed",    "color": "#d62728" } ]
+        ]
+      }
+    },
+
+    {
+      "type": "metric",
+      "x": 8, "y": 1, "width": 8, "height": 6,
+      "properties": {
+        "title": "Job wall-clock duration (seconds)",
+        "view": "timeSeries",
+        "stacked": false,
+        "region": "__REGION__",
+        "period": 300,
+        "metrics": [
+          [ "AnchorVoice", "JobDurationSeconds", "Service", "worker", { "label": "avg", "stat": "Average" } ],
+          [ "...", { "label": "p95", "stat": "p95" } ],
+          [ "...", { "label": "max", "stat": "Maximum" } ]
+        ]
+      }
+    },
+
+    {
+      "type": "metric",
+      "x": 16, "y": 1, "width": 8, "height": 6,
+      "properties": {
+        "title": "Audio processed (hours/day)",
+        "view": "timeSeries",
+        "stacked": false,
+        "region": "__REGION__",
+        "period": 86400,
+        "metrics": [
+          [ "AnchorVoice", "AudioDurationSeconds", "Service", "worker",
+            { "stat": "Sum", "label": "seconds", "visible": false } ],
+          [ { "expression": "m1/3600", "label": "hours", "id": "e1" } ]
+        ]
+      }
+    },
+
+    {
+      "type": "metric",
+      "x": 0, "y": 7, "width": 12, "height": 6,
+      "properties": {
+        "title": "Translation empty-rate by language (%)",
+        "view": "timeSeries",
+        "stacked": false,
+        "region": "__REGION__",
+        "stat": "Average",
+        "period": 300,
+        "yAxis": { "left": { "min": 0, "max": 100 } },
+        "metrics": [
+          [ { "expression": "SEARCH('{AnchorVoice,Service,Language} MetricName=\"TranslationEmptyRate\"', 'Average', 300)", "label": "", "id": "e1" } ]
+        ]
+      }
+    },
+
+    {
+      "type": "metric",
+      "x": 12, "y": 7, "width": 12, "height": 6,
+      "properties": {
+        "title": "Segments & speakers per job",
+        "view": "timeSeries",
+        "stacked": false,
+        "region": "__REGION__",
+        "period": 300,
+        "metrics": [
+          [ "AnchorVoice", "SegmentsProcessed", "Service", "worker", { "stat": "Average", "label": "segments (avg)" } ],
+          [ ".", "SpeakersDetected", ".", ".", { "stat": "Average", "label": "speakers (avg)" } ],
+          [ ".", "ChunksProcessed", ".", ".", { "stat": "Average", "label": "chunks (avg)" } ]
+        ]
+      }
+    },
+
+    {
+      "type": "text",
+      "x": 0, "y": 13, "width": 24, "height": 1,
+      "properties": { "markdown": "## AWS-native queue & dispatcher" }
+    },
+
+    {
+      "type": "metric",
+      "x": 0, "y": 14, "width": 8, "height": 6,
+      "properties": {
+        "title": "Input queue depth",
+        "view": "timeSeries",
+        "stacked": false,
+        "region": "__REGION__",
+        "period": 60,
+        "metrics": [
+          [ "AWS/SQS", "ApproximateNumberOfMessagesVisible",    "QueueName", "__INPUT_QUEUE_NAME__", { "label": "visible" } ],
+          [ ".",        "ApproximateNumberOfMessagesNotVisible", ".",          ".",                     { "label": "in-flight" } ]
+        ]
+      }
+    },
+
+    {
+      "type": "metric",
+      "x": 8, "y": 14, "width": 8, "height": 6,
+      "properties": {
+        "title": "DLQ depth (should stay at 0)",
+        "view": "timeSeries",
+        "stacked": false,
+        "region": "__REGION__",
+        "period": 60,
+        "metrics": [
+          [ "AWS/SQS", "ApproximateNumberOfMessagesVisible", "QueueName", "__DLQ_NAME__", { "label": "DLQ", "color": "#d62728" } ]
+        ]
+      }
+    },
+
+    {
+      "type": "metric",
+      "x": 16, "y": 14, "width": 8, "height": 6,
+      "properties": {
+        "title": "Oldest input message (seconds behind)",
+        "view": "timeSeries",
+        "stacked": false,
+        "region": "__REGION__",
+        "stat": "Maximum",
+        "period": 60,
+        "metrics": [
+          [ "AWS/SQS", "ApproximateAgeOfOldestMessage", "QueueName", "__INPUT_QUEUE_NAME__" ]
+        ]
+      }
+    },
+
+    {
+      "type": "metric",
+      "x": 0, "y": 20, "width": 12, "height": 6,
+      "properties": {
+        "title": "Lambda dispatcher — invocations & errors",
+        "view": "timeSeries",
+        "stacked": false,
+        "region": "__REGION__",
+        "period": 60,
+        "stat": "Sum",
+        "metrics": [
+          [ "AWS/Lambda", "Invocations", "FunctionName", "__LAMBDA_NAME__", { "label": "Invocations" } ],
+          [ ".",           "Errors",      ".",            ".",               { "label": "Errors", "color": "#d62728" } ],
+          [ ".",           "Throttles",   ".",            ".",               { "label": "Throttles" } ]
+        ]
+      }
+    },
+
+    {
+      "type": "metric",
+      "x": 12, "y": 20, "width": 12, "height": 6,
+      "properties": {
+        "title": "Lambda dispatcher — duration (ms)",
+        "view": "timeSeries",
+        "stacked": false,
+        "region": "__REGION__",
+        "period": 60,
+        "metrics": [
+          [ "AWS/Lambda", "Duration", "FunctionName", "__LAMBDA_NAME__", { "stat": "Average", "label": "avg" } ],
+          [ "...", { "stat": "p95", "label": "p95" } ],
+          [ "...", { "stat": "Maximum", "label": "max" } ]
+        ]
+      }
+    }
+  ]
+}

@@ -4,7 +4,7 @@ FROM python:3.12-slim AS builder
 WORKDIR /build
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    gcc g++ make curl \
+    gcc g++ make curl git \
     && rm -rf /var/lib/apt/lists/*
 
 # Pin uv by version tag so image builds are reproducible.
@@ -15,13 +15,18 @@ COPY --from=ghcr.io/astral-sh/uv:0.5.11 /uv /usr/local/bin/uv
 COPY pyproject.toml uv.lock ./
 COPY src/ ./src/
 
+# UV_PROJECT_ENVIRONMENT forces uv sync to install into /opt/venv instead of
+# its default (a .venv adjacent to pyproject.toml), so the runtime stage can
+# COPY /opt/venv cleanly.
+ENV UV_PROJECT_ENVIRONMENT=/opt/venv
 RUN uv venv /opt/venv && \
-    VIRTUAL_ENV=/opt/venv uv sync --frozen --no-dev
+    uv sync --frozen --no-dev
 
-# Pre-download silero-vad weights so runtime never hits torch.hub.
-RUN /opt/venv/bin/python -c "\
-import torch; \
-torch.hub.load('snakers4/silero-vad', 'silero_vad', force_reload=False, onnx=False)"
+# Pre-download silero-vad weights so the runtime stage never hits torch.hub
+# (no network egress, no git dependency at runtime).
+RUN /opt/venv/bin/python -c "import torch; \
+torch.hub.load('snakers4/silero-vad', 'silero_vad', \
+               force_reload=False, onnx=False, trust_repo=True)"
 
 
 # ── Stage 2: Runtime ─────────────────────────────────────────────────────────

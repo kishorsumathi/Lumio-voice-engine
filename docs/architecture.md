@@ -385,8 +385,96 @@ Most options are environment variables:
 | `TRANSLATION_FAILURE_THRESHOLD` | 0.05 | Max fraction of segments per language that may come back empty before the job is failed. |
 | `SQS_HEARTBEAT_INTERVAL_S` | 300 | How often the worker extends the input SQS message visibility. |
 | `SQS_HEARTBEAT_EXTEND_BY_S` | 3600 | How long to extend each heartbeat. |
+| `METRICS_NAMESPACE` | `AnchorVoice` | CloudWatch namespace the worker emits EMF metrics under. |
+| `METRICS_ENABLED` | `1` | Set to `0` / `false` to silence EMF emissions (useful in local dev). |
 
 **Translation batching (code constants in `translation.py`, not env):** max **900** characters and max **10** segments per translate batch; delimiter ` ⟦S⟧ `; **10** concurrent batch workers (`MAX_TRANSLATION_WORKERS`). Details under **Stage 5 — Translation** above.
+
+---
+
+## Observability — CloudWatch metrics & dashboard
+
+Runtime telemetry lands in CloudWatch with zero additional infra. The worker emits
+[**Embedded Metric Format (EMF)**](https://docs.aws.amazon.com/AmazonCloudWatch/latest/monitoring/CloudWatch_Embedded_Metric_Format_Specification.html)
+JSON lines to stdout; the awslogs driver ships them to CloudWatch Logs, which
+auto-extracts metrics under the `AnchorVoice` namespace. **No `PutMetricData`
+calls, no extra IAM, no sidecar.** If EMF is ever disabled (`METRICS_ENABLED=0`),
+the same lines are simply no longer printed — everything else keeps working.
+
+The emitter is `worker/src/pipeline/metrics.py`.
+
+### Metrics emitted
+
+All metrics carry the dimension `Service=worker`. Translation metrics add
+`Language=<target>` so they can be sliced per language.
+
+| Metric | Unit | Emitted when | Dimensions |
+|---|---|---|---|
+| `JobCompleted` | Count | Pipeline finishes successfully | `Service` |
+| `JobFailed` | Count | Pipeline raises (after `mark_failed`) | `Service` |
+| `JobDurationSeconds` | Seconds | Both outcomes (wall-clock from `process_job` entry) | `Service` |
+| `AudioDurationSeconds` | Seconds | Both outcomes (0 if failed before `ffprobe`) | `Service` |
+| `SegmentsProcessed` | Count | Both outcomes | `Service` |
+| `SpeakersDetected` | Count | Both outcomes | `Service` |
+| `ChunksProcessed` | Count | Both outcomes | `Service` |
+| `TranslationSegments` | Count | Per language after translation | `Service`, `Language` |
+| `TranslationEmptySegments` | Count | Per language after translation | `Service`, `Language` |
+| `TranslationEmptyRate` | Percent | Per language after translation | `Service`, `Language` |
+
+Dimension cardinality is deliberately bounded — no `job_id` or `s3_key` ends up
+as a metric dimension.
+
+### Dashboard
+
+`scripts/cloudwatch-dashboard.json` ships a 12-widget dashboard that pairs the
+EMF metrics with AWS-native signals:
+
+1. **Jobs completed vs failed** (AnchorVoice, Sum/5min)
+2. **Job wall-clock duration** — avg, p95, max
+3. **Audio hours processed per day** (Sum / 3600)
+4. **Translation empty-rate by language** — dynamic `SEARCH(...)` so new `Language`
+   dimensions show up automatically without editing the dashboard
+5. **Segments / speakers / chunks per job** — average
+6. **Input queue depth** — visible + in-flight (AWS/SQS)
+7. **DLQ depth** — should sit at 0 (AWS/SQS)
+8. **Oldest input message age** — catches stuck dispatcher (AWS/SQS)
+9. **Lambda dispatcher invocations / errors / throttles** (AWS/Lambda)
+10. **Lambda dispatcher duration** — avg / p95 / max (AWS/Lambda)
+
+Install / update:
+
+```bash
+make dashboard                             # uses defaults for names/region
+# or
+DASHBOARD_NAME=anchor-voice \
+AWS_REGION=ap-south-1 \
+INPUT_QUEUE_NAME=anchor-voice-jobs.fifo \
+DLQ_NAME=anchor-voice-jobs-dlq.fifo \
+LAMBDA_NAME=anchor-voice-dispatcher \
+  ./scripts/create_dashboard.sh
+```
+
+`put-dashboard` is idempotent — re-run anytime the template changes.
+
+### Verifying EMF works
+
+After the first job runs under ECS Fargate:
+
+```bash
+# Should show the AnchorVoice namespace:
+aws cloudwatch list-metrics --namespace AnchorVoice --region "$AWS_REGION"
+
+# Sum of jobs over the last hour:
+aws cloudwatch get-metric-statistics \
+  --namespace AnchorVoice --metric-name JobCompleted \
+  --dimensions Name=Service,Value=worker \
+  --start-time "$(date -u -v-1H '+%Y-%m-%dT%H:%M:%SZ')" \
+  --end-time   "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" \
+  --period 300 --statistics Sum --region "$AWS_REGION"
+```
+
+Metric extraction is driven entirely by the log group's retention + the EMF
+JSON shape — there is no additional configuration to wire up.
 
 ---
 
@@ -413,7 +501,9 @@ cd worker && uv sync && cd ..
 # 3. Start local PostgreSQL
 make db-up
 
-# 4. Create tables (idempotent — SQLAlchemy create_all, no migration framework)
+# 4. Create tables — LOCAL DEV ONLY.
+# In AWS, the worker self-bootstraps on every container start via
+# pipeline.main → create_tables(), so this step is not needed on ECS.
 DATABASE_URL=postgresql://anchorvoice:anchorvoice@localhost:5432/anchorvoice \
   uv run python scripts/init_db.py
 
@@ -421,6 +511,13 @@ DATABASE_URL=postgresql://anchorvoice:anchorvoice@localhost:5432/anchorvoice \
 DATABASE_URL=postgresql://anchorvoice:anchorvoice@localhost:5432/anchorvoice \
   uv run python scripts/run_local.py audio.mp3 --languages en
 ```
+
+> **Note on `scripts/`** — `scripts/init_db.py`, `scripts/run_local.py`, and
+> `scripts/create_dashboard.sh` are **developer tools** that live at the repo
+> root, not inside `worker/`. They are deliberately *not* copied into the
+> Docker image (which has build context `worker/`). The production worker
+> doesn't need them — it bootstraps its own schema from `pipeline.db` on
+> every cold-start.
 
 `scripts/run_local.py` writes three sidecar files next to the input audio:
 
@@ -430,24 +527,52 @@ DATABASE_URL=postgresql://anchorvoice:anchorvoice@localhost:5432/anchorvoice \
 | `<name>_translation_<lang>.txt` | One file per `--languages` target (same layout, translated text) |
 | stdout | Job id, speaker count, segment count |
 
-## AWS Setup (Manual)
+## AWS Setup
 
-Resources to create in `ap-south-1`:
+End-to-end deploy is scripted — `scripts/deploy.sh` is idempotent and phase-addressable. One command stands up every resource below; re-running only touches what's changed.
 
-| Resource | Purpose |
-|---|---|
-| S3 bucket | Audio uploads (`uploads/` prefix) and processed outputs (`processed/`) |
-| SQS FIFO queue | Ordered job queue; receives events from EventBridge |
-| EventBridge rule | Matches `s3:ObjectCreated` on `uploads/` prefix → targets SQS |
-| Lambda function | Reads SQS messages, calls ECS `RunTask` with job env vars |
-| ECS cluster + task definition | Runs `anchor-voice-worker` container (4 vCPU, 16 GB) |
-| ECR repository | Stores worker Docker images |
-| RDS PostgreSQL | Stores jobs, segments, translations (isolated subnet) |
-| Secrets Manager | Stores `anchor-voice/sarvam-api-key` |
-| VPC | Public subnets for ECS (`assignPublicIp=ENABLED`), isolated subnets for RDS |
-| S3 Gateway Endpoint | Free; keeps S3 traffic inside AWS |
+```bash
+export SARVAM_API_KEY='sk_...'
+export RDS_MASTER_PASSWORD='Strong!Pa55word'
+export AWS_REGION='ap-south-1'     # optional
+export ENV='prd'                   # optional — names all resources ${APP}-${ENV}-*
+make deploy                        # or: ./scripts/deploy.sh
+```
 
-Networking note: ECS tasks use `assignPublicIp=ENABLED` in public subnets — no NAT gateway needed. RDS is accessible only from ECS via security group rule, never from the internet.
+Re-runs:
+
+```bash
+make deploy-image                  # rebuild image + register new task def revision
+./scripts/deploy.sh lambda         # update lambda code + env only
+./scripts/deploy.sh iam            # refresh IAM policies only
+```
+
+Resources the script provisions (region defaults to `ap-south-1`):
+
+| Resource | Name | Purpose |
+|---|---|---|
+| S3 bucket | `${NS}-audio-${ACCOUNT}-${REGION}` | Audio uploads (`uploads/` prefix); SSE-S3, public access blocked |
+| SQS FIFO — input | `${NS}-transcription-jobs.fifo` | Job queue; `VisibilityTimeout=900`, `maxReceiveCount=3`, content dedup |
+| SQS FIFO — DLQ | `${NS}-transcription-jobs-dlq.fifo` | Poison-message parking |
+| SQS FIFO — events | `${NS}-job-events.fifo` | `job.completed` / `job.failed` fan-out |
+| Lambda | `${NS}-job-dispatcher` | SQS-triggered ECS `RunTask` dispatcher with `ReportBatchItemFailures` |
+| ECS cluster + task def | `${NS}` / `${NS}-worker` | Fargate 2 vCPU / 8 GB (tune in `scripts/deploy.sh`) |
+| ECR | `${APP}/worker` | Worker Docker images, scan-on-push |
+| RDS PostgreSQL | `${NS}-postgres` | `db.t4g.micro`, gp3, encrypted, isolated SG |
+| Secrets Manager | `${APP}/${ENV}/sarvam-api-key`, `${APP}/${ENV}/rds-credentials` | Runtime credentials fetched by worker |
+| CloudWatch log groups | `/ecs/${NS}-worker`, `/aws/lambda/${LAMBDA_NAME}` | 30-day retention |
+| CloudWatch dashboard | `${NS}` | EMF metrics + SQS/Lambda signals (see Observability) |
+| VPC | Default VPC | Public subnets for ECS (`assignPublicIp=ENABLED`), RDS reachable only from ECS SG |
+| Security groups | `${NS}-ecs`, `${NS}-rds` | RDS ingress `5432` only from ECS SG |
+
+Networking: ECS tasks use `assignPublicIp=ENABLED` in public subnets — no NAT gateway. RDS is reachable only from the ECS SG, never the internet.
+
+Send a test job:
+
+```bash
+make send-test f=s3://${S3_BUCKET}/uploads/rec02.m4a
+aws logs tail /ecs/${NS}-worker --region ${AWS_REGION} --follow
+```
 
 ---
 

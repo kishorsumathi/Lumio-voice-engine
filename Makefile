@@ -1,9 +1,14 @@
-.PHONY: help install db-up db-down init-db worker-build worker-push run-local lint clean
+.PHONY: help install db-up db-down init-db worker-build worker-push run-local lint clean dashboard deploy deploy-image deploy-eventbridge send-test
 
 REGION         ?= ap-south-1
 ACCOUNT_ID     := $(shell aws sts get-caller-identity --query Account --output text 2>/dev/null)
 ECR_REPO       := $(ACCOUNT_ID).dkr.ecr.$(REGION).amazonaws.com/anchor-voice-worker
 DATABASE_URL   ?= postgresql://anchorvoice:anchorvoice@localhost:5432/anchorvoice
+
+DASHBOARD_NAME    ?= anchor-voice
+INPUT_QUEUE_NAME  ?= anchor-voice-jobs.fifo
+DLQ_NAME          ?= anchor-voice-jobs-dlq.fifo
+LAMBDA_NAME       ?= anchor-voice-dispatcher
 
 help:
 	@echo ""
@@ -17,6 +22,15 @@ help:
 	@echo "  Docker / ECR"
 	@echo "    make worker-build   Build worker Docker image"
 	@echo "    make worker-push    Push image to ECR"
+	@echo ""
+	@echo "  Deployment (idempotent)"
+	@echo "    make deploy         Full deploy (SARVAM_API_KEY + RDS_MASTER_PASSWORD in env)"
+	@echo "    make deploy-image   Rebuild image + register new task def revision only"
+	@echo "    make deploy-eventbridge  Wire S3 uploads to input SQS via EventBridge"
+	@echo "    make send-test f=s3://bucket/key"
+	@echo ""
+	@echo "  Observability"
+	@echo "    make dashboard      Install/update CloudWatch dashboard"
 	@echo ""
 	@echo "  Quality"
 	@echo "    make lint           Run ruff linter"
@@ -56,6 +70,31 @@ worker-push: worker-build
 	docker tag anchor-voice-worker:latest $(ECR_REPO):latest
 	docker push $(ECR_REPO):latest
 	@echo "Pushed $(ECR_REPO):latest"
+
+# ── Deployment ─────────────────────────────────────────────────────────────────
+
+deploy:
+	./scripts/deploy.sh
+
+deploy-image:
+	./scripts/deploy.sh image
+
+deploy-eventbridge:
+	./scripts/deploy.sh eventbridge
+
+send-test:
+	@test -n "$(f)" || (echo "Usage: make send-test f=s3://bucket/key" && exit 1)
+	./scripts/send_test_job.sh $(f)
+
+# ── Observability ──────────────────────────────────────────────────────────────
+
+dashboard:
+	DASHBOARD_NAME=$(DASHBOARD_NAME) \
+	  AWS_REGION=$(REGION) \
+	  INPUT_QUEUE_NAME=$(INPUT_QUEUE_NAME) \
+	  DLQ_NAME=$(DLQ_NAME) \
+	  LAMBDA_NAME=$(LAMBDA_NAME) \
+	  ./scripts/create_dashboard.sh
 
 # ── Quality ────────────────────────────────────────────────────────────────────
 

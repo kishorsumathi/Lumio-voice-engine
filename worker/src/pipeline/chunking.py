@@ -56,8 +56,14 @@ class ChunkInfo:
 
 
 def _run_silero_vad(wav_path: Path) -> list[SilenceSegment]:
+    # Audio is loaded via soundfile (already a dep) rather than torchaudio.load.
+    # torchaudio ≥ 2.9 delegates decoding to a separate torchcodec package which
+    # is not in our image and isn't worth the bloat — soundfile reads WAV/FLAC
+    # natively via libsndfile, which ffmpeg has already normalised to 16kHz mono
+    # upstream (convert_to_mono_wav).
+    import numpy as np
+    import soundfile as sf
     import torch
-    import torchaudio
 
     model, utils = torch.hub.load(
         repo_or_dir="snakers4/silero-vad",
@@ -68,11 +74,20 @@ def _run_silero_vad(wav_path: Path) -> list[SilenceSegment]:
     )
     get_speech_ts, *_ = utils
 
-    waveform, sr = torchaudio.load(str(wav_path))
+    audio_np, sr = sf.read(str(wav_path), dtype="float32", always_2d=False)
+    # Defensive: collapse any stereo to mono (ffmpeg already produces mono).
+    if audio_np.ndim > 1:
+        audio_np = audio_np.mean(axis=1)
     if sr != 16000:
-        resampler = torchaudio.transforms.Resample(orig_freq=sr, new_freq=16000)
-        waveform = resampler(waveform)
-    waveform = waveform.squeeze(0)
+        # Extremely rare path — ffmpeg already resampled. Keep a fallback using
+        # torchaudio.functional so we don't silently drift when the upstream
+        # contract changes.
+        import torchaudio.functional as F
+        waveform = F.resample(
+            torch.from_numpy(audio_np), orig_freq=sr, new_freq=16000
+        )
+    else:
+        waveform = torch.from_numpy(np.ascontiguousarray(audio_np))
 
     speech_timestamps = get_speech_ts(
         waveform,

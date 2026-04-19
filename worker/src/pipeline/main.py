@@ -14,6 +14,7 @@ import os
 import sys
 import tempfile
 import threading
+import time
 import traceback
 import uuid
 from datetime import datetime, timezone
@@ -29,6 +30,7 @@ from .db import create_tables, health_check
 from .events import publish_job_event
 from .job_status import create_job, mark_failed, store_results, update_status
 from .merger import merge
+from .metrics import emit_job_outcome, emit_translation_coverage
 from .s3 import download_audio
 from .transcription import transcribe_all_chunks
 from .translation import translate_segments
@@ -125,6 +127,12 @@ def process_job(
     job_id = create_job(s3_bucket, s3_key, original_filename)
     log = logger.bind(job_id=str(job_id), s3_key=s3_key)
 
+    wall_start = time.monotonic()
+    duration = 0.0
+    num_chunks = 0
+    num_segments = 0
+    num_speakers = 0
+
     # Start SQS heartbeat if we have the handles
     heartbeat = None
     if receipt_handle and queue_url:
@@ -148,18 +156,20 @@ def process_job(
             update_status(job_id, "chunking", audio_duration_seconds=round(duration, 2))
             log.info("Chunking audio")
             chunks = chunk_audio(audio_path, work_dir)
-            log.info("Chunks created", count=len(chunks))
+            num_chunks = len(chunks)
+            log.info("Chunks created", count=num_chunks)
 
             # ── 4. Transcribe chunks (parallel) ───────────────────────────
-            update_status(job_id, "transcribing", num_chunks=len(chunks))
-            log.info("Transcribing chunks", num_chunks=len(chunks))
+            update_status(job_id, "transcribing", num_chunks=num_chunks)
+            log.info("Transcribing chunks", num_chunks=num_chunks)
             transcript_segments = transcribe_all_chunks(chunks)
             log.info("Transcription complete", num_segments=len(transcript_segments))
 
             # ── 5. Merge + stitch speakers across chunks ──────────────────
             update_status(job_id, "merging")
             merged = merge(chunks, transcript_segments)
-            log.info("Merge complete", num_merged=len(merged))
+            num_segments = len(merged)
+            log.info("Merge complete", num_merged=num_segments)
 
             # ── 6. Translate ──────────────────────────────────────────────
             langs = target_languages or DEFAULT_TARGET_LANGUAGES
@@ -184,6 +194,11 @@ def process_job(
                     empty_segments=empty,
                     nonempty_source=nonempty_src,
                     failure_rate=round(fail_rate, 4),
+                )
+                emit_translation_coverage(
+                    language=lang,
+                    empty_segments=empty,
+                    nonempty_source=nonempty_src,
                 )
                 if fail_rate > TRANSLATION_FAILURE_THRESHOLD:
                     raise RuntimeError(
@@ -213,6 +228,7 @@ def process_job(
                 for lang, trans_list in translations.items()
             }
             num_speakers = len(set(s.speaker_id for s in merged))
+            num_segments = len(merged)
             store_results(
                 job_id,
                 segments_for_db,
@@ -223,6 +239,15 @@ def process_job(
 
             log.info("Pipeline complete")
             _delete_sqs_message(queue_url, receipt_handle)
+
+            emit_job_outcome(
+                status="completed",
+                wall_clock_s=time.monotonic() - wall_start,
+                audio_duration_s=duration,
+                num_segments=num_segments,
+                num_speakers=num_speakers,
+                num_chunks=num_chunks,
+            )
 
             # Best-effort notify. RDS has already committed; if this fails the
             # consumer can still reconcile from the jobs table.
@@ -235,8 +260,8 @@ def process_job(
                     "s3_key": s3_key,
                     "original_filename": original_filename,
                     "audio_duration_seconds": round(duration, 2),
-                    "num_chunks": len(chunks),
-                    "num_segments": len(merged),
+                    "num_chunks": num_chunks,
+                    "num_segments": num_segments,
                     "num_speakers": num_speakers,
                     "target_languages": langs,
                     "completed_at": datetime.now(timezone.utc).isoformat(),
@@ -251,6 +276,14 @@ def process_job(
             except Exception as mark_exc:
                 log.error("mark_failed itself failed — job row may be stale",
                           error=str(mark_exc))
+            emit_job_outcome(
+                status="failed",
+                wall_clock_s=time.monotonic() - wall_start,
+                audio_duration_s=duration,
+                num_segments=num_segments,
+                num_speakers=num_speakers,
+                num_chunks=num_chunks,
+            )
             publish_job_event(
                 "job.failed",
                 {

@@ -58,3 +58,9 @@ htmlcov/
 # Transcript / translation sidecar files written by scripts/run_local.py
 *_transcript.txt
 *_translation_*.txt
+
+# ── Deploy state (resolved ARNs / IDs cached between deploy.sh phases) ────────
+.deploy-state/
+
+# ── Lambda deploy artifact (built by scripts/deploy.sh from handler.py) ───────
+lambda/*.zip
