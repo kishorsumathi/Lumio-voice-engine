@@ -58,8 +58,8 @@ aws secretsmanager create-secret \
   --name anchor-voice/sarvam-api-key \
   --secret-string "YOUR_SARVAM_KEY"
 
-# Build and push worker image
-make worker-push    # requires ECR repo already created
+# Build and push worker image (ECR repo name must exist: anchor-voice/worker — same as ./scripts/deploy.sh)
+make worker-push    # or: ./scripts/deploy.sh ecr   (creates repo + build + push)
 
 # Create tables on RDS (idempotent, safe to re-run)
 DATABASE_URL='postgresql+psycopg2://USER:PASS@HOST:5432/DBNAME' \

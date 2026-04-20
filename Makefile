@@ -2,7 +2,9 @@
 
 REGION         ?= ap-south-1
 ACCOUNT_ID     := $(shell aws sts get-caller-identity --query Account --output text 2>/dev/null)
-ECR_REPO       := $(ACCOUNT_ID).dkr.ecr.$(REGION).amazonaws.com/anchor-voice-worker
+# Must match scripts/deploy.sh (ECR_REPO="${APP}/worker" with APP=anchor-voice)
+ECR_REGISTRY   := $(ACCOUNT_ID).dkr.ecr.$(REGION).amazonaws.com
+ECR_IMAGE       := $(ECR_REGISTRY)/anchor-voice/worker
 DATABASE_URL   ?= postgresql://anchorvoice:anchorvoice@localhost:5432/anchorvoice
 
 DASHBOARD_NAME    ?= anchor-voice
@@ -21,7 +23,7 @@ help:
 	@echo ""
 	@echo "  Docker / ECR"
 	@echo "    make worker-build   Build worker Docker image"
-	@echo "    make worker-push    Push image to ECR"
+	@echo "    make worker-push    Push image to ECR (repo: anchor-voice/worker)"
 	@echo ""
 	@echo "  Deployment (idempotent)"
 	@echo "    make deploy         Full deploy (SARVAM_API_KEY + RDS_MASTER_PASSWORD in env)"
@@ -66,14 +68,14 @@ run-local:
 # ── Docker / ECR ───────────────────────────────────────────────────────────────
 
 worker-build:
-	docker build -t anchor-voice-worker:latest worker/
+	docker build --platform linux/amd64 -t anchor-voice/worker:latest worker/
 
 worker-push: worker-build
 	aws ecr get-login-password --region $(REGION) | \
-	  docker login --username AWS --password-stdin $(ECR_REPO)
-	docker tag anchor-voice-worker:latest $(ECR_REPO):latest
-	docker push $(ECR_REPO):latest
-	@echo "Pushed $(ECR_REPO):latest"
+	  docker login --username AWS --password-stdin $(ECR_REGISTRY)
+	docker tag anchor-voice/worker:latest $(ECR_IMAGE):latest
+	docker push $(ECR_IMAGE):latest
+	@echo "Pushed $(ECR_IMAGE):latest"
 
 # ── Deployment ─────────────────────────────────────────────────────────────────
 
