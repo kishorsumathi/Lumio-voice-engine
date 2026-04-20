@@ -85,13 +85,22 @@ def ensure_audio_only(file_path: Path, dest_dir: Path) -> Path:
     return out_path
 
 
-def convert_to_mono_wav(file_path: Path, dest_dir: Path, sample_rate: int = 16000) -> Path:
+def convert_to_mono_wav(
+    file_path: Path,
+    dest_dir: Path,
+    sample_rate: int = 16000,
+    *,
+    output_path: Path | None = None,
+) -> Path:
     """
-    Convert audio to 16kHz mono WAV — required by silero-vad and pyannote.audio.
-    Returns the converted file path. If already 16kHz mono WAV, returns original.
+    Convert audio to 16 kHz mono 16-bit PCM WAV (Sarvam-recommended profile).
+
+    Used for silero-vad (default output: ``{stem}_16k_mono.wav`` in dest_dir)
+    and for single-chunk Sarvam uploads when ``output_path`` is set.
     """
-    out_path = dest_dir / (file_path.stem + "_16k_mono.wav")
-    logger.info("Converting to 16kHz mono WAV: %s", file_path.name)
+    out_path = output_path or (dest_dir / (file_path.stem + "_16k_mono.wav"))
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    logger.info("Converting to 16kHz mono WAV: %s → %s", file_path.name, out_path.name)
     subprocess.run(
         [
             "ffmpeg", "-y", "-i", str(file_path),
@@ -112,21 +121,22 @@ def split_audio_segment(
     end_ms: int,
 ) -> Path:
     """
-    Extract a time slice [start_ms, end_ms] from source_path into dest_path.
-    Re-encodes to MP3 (192k) — universally compatible with Sarvam and avoids
-    container/codec mismatch errors when the source has an unusual extension.
+    Extract a time slice [start_ms, end_ms] from ``source_path`` into ``dest_path``.
+
+    ``source_path`` must already be **16 kHz mono 16-bit PCM WAV** (e.g. the full-file
+    output of :func:`convert_to_mono_wav`). Uses ffmpeg **stream copy** — no
+    per-chunk resample — so chunk files match that profile with minimal CPU.
     """
     start_s = start_ms / 1000.0
     duration_s = (end_ms - start_ms) / 1000.0
+    dest_path.parent.mkdir(parents=True, exist_ok=True)
     subprocess.run(
         [
             "ffmpeg", "-y",
             "-ss", f"{start_s:.3f}",
             "-i", str(source_path),
             "-t", f"{duration_s:.3f}",
-            "-acodec", "libmp3lame",
-            "-b:a", "192k",
-            "-ar", "44100",
+            "-c", "copy",
             str(dest_path),
         ],
         check=True, capture_output=True, timeout=_FFMPEG_TIMEOUT_S,

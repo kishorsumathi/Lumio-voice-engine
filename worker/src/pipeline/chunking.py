@@ -11,7 +11,6 @@ Strategy:
      boundary so the overlap region can be used for speaker ID stitching.
 """
 import logging
-import shutil
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -179,9 +178,9 @@ def chunk_audio(
 
     # ── Fast path: fits within Sarvam's 60-min limit → no split needed ──
     if total_duration <= SARVAM_MAX_SINGLE_DURATION_S:
-        chunk_path = dest_dir / f"chunk_000{source_path.suffix}"
-        shutil.copy2(str(source_path), str(chunk_path))
-        logger.info("Single chunk (no split needed)")
+        chunk_path = dest_dir / "chunk_000.wav"
+        convert_to_mono_wav(source_path, dest_dir, output_path=chunk_path)
+        logger.info("Single chunk (no split needed), 16 kHz mono WAV for Sarvam")
         return [ChunkInfo(
             path=chunk_path,
             index=0,
@@ -238,9 +237,10 @@ def chunk_audio(
 
         start_ms = int(audio_start * 1000)
         end_ms = int(end_time * 1000)
-        chunk_path = dest_dir / f"chunk_{idx:03d}.mp3"
+        chunk_path = dest_dir / f"chunk_{idx:03d}.wav"
 
-        split_audio_segment(source_path, chunk_path, start_ms, end_ms)
+        # Same 16 kHz mono master as VAD: one normalize, N ffmpeg stream-copies
+        split_audio_segment(wav_path, chunk_path, start_ms, end_ms)
 
         logger.info(
             "Chunk %d: file=%.1fs–%.1fs, content=%.1fs–%.1fs (%.1fmin) [%s]",

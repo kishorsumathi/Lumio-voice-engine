@@ -96,7 +96,7 @@ Uploads land at `uploads/{uuid}/{filename}` which EventBridge already routes to 
 │   └── src/pipeline/
 │       ├── main.py          # Orchestrator + SQS heartbeat
 │       ├── config.py        # All env vars + Secrets Manager
-│       ├── audio.py         # Duration detection, format conversion
+│       ├── audio.py         # Duration, video→audio extract; 16 kHz mono WAV for Sarvam
 │       ├── chunking.py      # VAD-based smart splitting with overlap
 │       ├── transcription.py # Sarvam batch API, parallel chunks
 │       ├── merger.py        # Cross-chunk speaker stitching
@@ -144,7 +144,7 @@ WHERE t.target_language = 'en-IN' AND s.job_id = '...';
 - **No NAT gateway** — ECS in public subnets saves ~$32/month; RDS in isolated subnets
 - **Sarvam-only** — transcription, diarization, and translation all via Sarvam APIs
 - **100 RPM shared** — single sliding-window rate limiter across all Sarvam calls
-- **Sessions ≤ 60 min** — single chunk, no splitting or stitching needed (covers most medical sessions)
+- **Sarvam STT audio** — Every batch upload is **16 kHz, mono, 16-bit WAV (`pcm_s16le`)** per [Sarvam’s STT FAQ](https://docs.sarvam.ai/api-reference-docs/speech-to-text/faq). Sessions **≤ 60 min** use one `chunk_000.wav` (no VAD split / stitch — typical medical session). Longer audio: one full-file normalize, **VAD on that master**, then overlapping **`chunk_NNN.wav`** slices via ffmpeg **stream copy** (no per-chunk resample).
 - **Translation batching** — up to 10 segments / 900 chars per Mayura call (delimiter `⟦S⟧`); ~10× fewer API calls than per-segment translation
 - **Indic-passthrough repair with Lingua LID** — for `en-IN` targets, segments where Mayura auto-detect returns the Hinglish input unchanged are re-translated with an explicit source code. Byte-level script regex is the entry gate (*should we retry?*); [Lingua](https://github.com/pemistahl/lingua-py) — restricted to the 9 Indian languages it ships models for + English, 0.75 confidence floor — picks the actual Mayura source code from the original text, which disambiguates **Hindi vs Marathi** (both Devanagari) that pure Unicode ranges can't. Kannada, Malayalam, Odia and every other script with a unique Unicode block go through the regex fallback (100% accurate, no lingua needed). See [docs/architecture.md](docs/architecture.md#en-in-indic-passthrough-retry-pass).
 - **Completion events via SQS** — on finish (success or failure) the worker publishes one self-contained SQS message (`job.completed` / `job.failed`) to `JOB_EVENTS_QUEUE_URL`. Your API backend / frontend consumes it instead of polling RDS. Schema + consumer sketch in [docs/architecture.md](docs/architecture.md#stage-7--completion-event-fan-out-notification).

@@ -62,7 +62,8 @@ Target users: doctors, therapists, psychiatrists recording clinical sessions.
 
 - Detects audio duration via `ffprobe`
 - If file contains a video stream (e.g. `.mp4`), extracts audio-only to `.m4a` via ffmpeg
-- Supported formats: `.wav`, `.mp3`, `.m4a`, `.flac`, `.ogg`, `.aac`, `.webm`, `.mp4`
+- Supported **upload** formats: `.wav`, `.mp3`, `.m4a`, `.flac`, `.ogg`, `.aac`, `.webm`, `.mp4`
+- **`convert_to_mono_wav`** produces **16 kHz, mono, 16-bit PCM WAV (`pcm_s16le`)** for Sarvam; **`split_audio_segment`** time-slices that normalized master with ffmpeg **stream copy** (no per-chunk resample; see Stage 2)
 
 ---
 
@@ -70,7 +71,7 @@ Target users: doctors, therapists, psychiatrists recording clinical sessions.
 
 **File:** `chunking.py`
 
-Sarvam accepts a maximum of 60 minutes per request. For sessions under 60 minutes (most therapy/medical sessions), the audio is passed as a single chunk — no splitting, no stitching needed.
+Sarvam accepts a maximum of 60 minutes per request. For sessions under 60 minutes (most therapy/medical sessions), the job still uses **one** logical chunk — **no silence-based splitting and no cross-chunk stitching** — but the file is **normalized to `chunk_000.wav`** (16 kHz mono PCM) before upload, not sent as the raw upload codec.
 
 For audio over 60 minutes:
 
@@ -106,6 +107,15 @@ The 2-minute overlap prefix is used for cross-chunk speaker stitching (Stage 4).
 - `content_start` — where this chunk's unique content begins (= previous chunk's end)
 - `end_time` — end of this chunk's unique content
 - `split_reason` — why the split happened at this point
+
+**Audio sent to Sarvam (batch STT):** every upload is **WAV at 16 kHz, mono, 16-bit PCM (`pcm_s16le`)**, aligned with [Sarvam’s STT FAQ](https://docs.sarvam.ai/api-reference-docs/speech-to-text/faq) (“16 kHz or higher”, 16-bit, mono or stereo).
+
+| Case | File | How |
+|------|------|-----|
+| Duration ≤ 60 min | `chunk_000.wav` | `convert_to_mono_wav(..., output_path=chunk_000.wav)` |
+| Duration > 60 min | `chunk_000.wav`, `chunk_001.wav`, … | `split_audio_segment` on `{stem}_16k_mono.wav` (ffmpeg **`-c copy`**, same timeline as VAD) |
+
+For long audio, **silero-vad** runs on **`{stem}_16k_mono.wav`**; Sarvam **`chunk_*.wav`** files are **slices of that same master** (not re-decoded from the original upload per chunk). The master is deleted after chunk files are written.
 
 ---
 
