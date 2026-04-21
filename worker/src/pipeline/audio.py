@@ -14,31 +14,62 @@ _FFPROBE_TIMEOUT_S = 30
 _FFMPEG_TIMEOUT_S = 1800  # 30 min — covers full-session conversions
 
 
-def _ffprobe_streams(file_path: Path) -> list[dict]:
-    """Run ffprobe and return the list of streams. Raises on probe failure."""
+def _ffprobe_json(file_path: Path, *, include_format: bool = False) -> dict:
+    """Run ffprobe and return the parsed JSON. Raises on probe failure."""
+    args = [
+        "ffprobe", "-v", "quiet",
+        "-print_format", "json",
+        "-show_streams",
+    ]
+    if include_format:
+        args.append("-show_format")
+    args.append(str(file_path))
     result = subprocess.run(
-        [
-            "ffprobe", "-v", "quiet",
-            "-print_format", "json",
-            "-show_streams",
-            str(file_path),
-        ],
+        args,
         capture_output=True, text=True, check=True,
         timeout=_FFPROBE_TIMEOUT_S,
     )
-    data = json.loads(result.stdout)
-    return data.get("streams", []) or []
+    return json.loads(result.stdout)
+
+
+def _ffprobe_streams(file_path: Path) -> list[dict]:
+    """Run ffprobe and return the list of streams. Raises on probe failure."""
+    return _ffprobe_json(file_path).get("streams", []) or []
+
+
+def _safe_float(value) -> float:
+    try:
+        return float(value) if value is not None else 0.0
+    except (TypeError, ValueError):
+        return 0.0
 
 
 def get_duration(file_path: Path) -> float:
-    """Return audio duration in seconds using ffprobe."""
-    streams = _ffprobe_streams(file_path)
-    for stream in streams:
+    """
+    Return audio duration in seconds using ffprobe.
+
+    Tries the audio stream's ``duration`` first (cheapest, what most clean
+    containers expose), then falls back to the format-level ``duration``.
+    Browser ``MediaRecorder`` WebM files often ship with no Matroska
+    ``Duration`` element at all — the worker's upstream normalization step
+    rewrites those to WAV which always has a usable ``duration``, but this
+    fallback keeps the helper robust if it is ever called on other formats
+    where only ``format.duration`` is populated.
+    """
+    data = _ffprobe_json(file_path, include_format=True)
+    for stream in data.get("streams", []) or []:
         if stream.get("codec_type") == "audio":
-            duration = float(stream.get("duration", 0))
+            duration = _safe_float(stream.get("duration"))
             if duration > 0:
                 logger.info("Duration: %.1fs for %s", duration, file_path.name)
                 return duration
+    fmt_duration = _safe_float((data.get("format") or {}).get("duration"))
+    if fmt_duration > 0:
+        logger.info(
+            "Duration (format fallback): %.1fs for %s",
+            fmt_duration, file_path.name,
+        )
+        return fmt_duration
     raise RuntimeError(f"Could not determine audio duration for {file_path.name}")
 
 
@@ -95,6 +126,11 @@ def convert_to_mono_wav(
     """
     Convert audio to 16 kHz mono 16-bit PCM WAV (Sarvam-recommended profile).
 
+    Also drops any video stream via ``-vn`` so video-muxed containers
+    (``.mp4``, video-bearing ``.webm``) are handled in one pass — the
+    pipeline can skip a separate audio-extraction step and normalize
+    straight from the original upload.
+
     Used for silero-vad (default output: ``{stem}_16k_mono.wav`` in dest_dir)
     and for single-chunk Sarvam uploads when ``output_path`` is set.
     """
@@ -104,6 +140,7 @@ def convert_to_mono_wav(
     subprocess.run(
         [
             "ffmpeg", "-y", "-i", str(file_path),
+            "-vn",                     # drop any video stream
             "-ar", str(sample_rate),   # resample to target rate
             "-ac", "1",                # mono
             "-acodec", "pcm_s16le",    # 16-bit PCM WAV

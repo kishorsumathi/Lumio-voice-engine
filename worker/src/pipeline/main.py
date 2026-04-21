@@ -23,7 +23,7 @@ from pathlib import Path
 import boto3
 import structlog
 
-from .audio import ensure_audio_only, get_duration
+from .audio import convert_to_mono_wav, get_duration
 from .chunking import chunk_audio
 from .config import DEFAULT_TARGET_LANGUAGES, TRANSLATION_FAILURE_THRESHOLD
 from .db import create_tables, health_check
@@ -161,15 +161,25 @@ def process_job(
                     )
                     target_languages = meta_langs
 
-            # ── 2. Validate + prepare ────────────────────────────────────
-            audio_path = ensure_audio_only(audio_path, work_dir)
+            # ── 2. Normalize to 16 kHz mono PCM WAV up-front ─────────────
+            # One canonical format for the whole pipeline. The resulting
+            # WAV always has a usable RIFF duration header, which fixes
+            # browser-recorded WebM uploads (Chrome MediaRecorder omits
+            # Matroska Duration) and handles video-muxed containers in
+            # the same pass via `-vn`.
+            log.info("Normalizing audio to 16 kHz mono WAV")
+            audio_path = convert_to_mono_wav(audio_path, work_dir)
             duration = get_duration(audio_path)
+            if duration <= 0:
+                raise RuntimeError(
+                    "Normalized audio has non-positive duration — upload may be empty or undecodable"
+                )
             log.info("Audio ready", duration_s=round(duration, 1), filename=audio_path.name)
 
             # ── 3. Chunk ─────────────────────────────────────────────────
             update_status(job_id, "chunking", audio_duration_seconds=round(duration, 2))
             log.info("Chunking audio")
-            chunks = chunk_audio(audio_path, work_dir)
+            chunks = chunk_audio(audio_path, work_dir, already_normalized=True)
             num_chunks = len(chunks)
             log.info("Chunks created", count=num_chunks)
 

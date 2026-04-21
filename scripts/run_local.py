@@ -28,7 +28,7 @@ logging.basicConfig(
     datefmt="%H:%M:%S",
 )
 
-from pipeline.audio import ensure_audio_only, get_duration
+from pipeline.audio import convert_to_mono_wav, get_duration
 from pipeline.chunking import chunk_audio
 from pipeline.db import create_tables, health_check
 from pipeline.job_status import create_job, mark_failed, store_results, update_status
@@ -128,12 +128,20 @@ def run(audio_path: Path, target_languages: list[str]) -> None:
                 local_audio = renamed
 
             update_status(job_id, "downloading")
-            local_audio = ensure_audio_only(local_audio, work_dir)
+            # Normalize to 16 kHz mono PCM WAV up-front — same contract as
+            # the production worker (guarantees a readable RIFF duration
+            # header even for browser MediaRecorder WebM, handles video
+            # containers via `-vn`, standardizes the rest of the pipeline).
+            local_audio = convert_to_mono_wav(local_audio, work_dir)
             duration = get_duration(local_audio)
+            if duration <= 0:
+                raise RuntimeError(
+                    "Normalized audio has non-positive duration — upload may be empty or undecodable"
+                )
             print(f"Duration: {duration:.1f}s ({duration/60:.1f} min)")
 
             update_status(job_id, "chunking", audio_duration_seconds=round(duration, 2))
-            chunks = chunk_audio(local_audio, work_dir)
+            chunks = chunk_audio(local_audio, work_dir, already_normalized=True)
             print(f"Chunks: {len(chunks)}")
             for c in chunks:
                 print(f"  [{c.index}] {c.start_time:.1f}s–{c.end_time:.1f}s "

@@ -11,6 +11,7 @@ Strategy:
      boundary so the overlap region can be used for speaker ID stitching.
 """
 import logging
+import shutil
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -163,23 +164,37 @@ def chunk_audio(
     target_duration: int = TARGET_CHUNK_DURATION_S,
     max_duration: int = MAX_CHUNK_DURATION_S,
     overlap_duration: int = OVERLAP_DURATION_S,
+    *,
+    already_normalized: bool = False,
 ) -> list[ChunkInfo]:
     """
     Split source_path into overlapping chunks for Sarvam transcription.
 
     Each chunk (except the first) starts overlap_duration seconds before
     its content_start so the overlap region can be used for speaker stitching.
+
+    When ``already_normalized`` is True, ``source_path`` is assumed to be a
+    16 kHz mono 16-bit PCM WAV produced by :func:`convert_to_mono_wav`, and
+    we skip re-encoding — the short path copies the file to ``chunk_000.wav``
+    and the long path uses it directly as the VAD master.
     """
     total_duration = get_duration(source_path)
     logger.info(
-        "Chunking %s — total=%.1fs, target=%ds, max=%ds, overlap=%ds",
+        "Chunking %s — total=%.1fs, target=%ds, max=%ds, overlap=%ds, already_normalized=%s",
         source_path.name, total_duration, target_duration, max_duration, overlap_duration,
+        already_normalized,
     )
 
     # ── Fast path: fits within Sarvam's 60-min limit → no split needed ──
     if total_duration <= SARVAM_MAX_SINGLE_DURATION_S:
         chunk_path = dest_dir / "chunk_000.wav"
-        convert_to_mono_wav(source_path, dest_dir, output_path=chunk_path)
+        if already_normalized:
+            # Source is already the canonical 16 kHz mono PCM WAV — just
+            # materialize it as chunk_000.wav (cheap copy within tempdir).
+            if source_path.resolve() != chunk_path.resolve():
+                shutil.copy2(source_path, chunk_path)
+        else:
+            convert_to_mono_wav(source_path, dest_dir, output_path=chunk_path)
         logger.info("Single chunk (no split needed), 16 kHz mono WAV for Sarvam")
         return [ChunkInfo(
             path=chunk_path,
@@ -191,9 +206,14 @@ def chunk_audio(
             split_reason="single",
         )]
 
-    # ── Convert to mono WAV for VAD ───────────────────────────────────────
-    logger.info("Converting to mono WAV for VAD analysis")
-    wav_path = convert_to_mono_wav(source_path, dest_dir)
+    # ── Mono WAV master for VAD ──────────────────────────────────────────
+    if already_normalized:
+        wav_path = source_path
+        wav_is_owned = False
+    else:
+        logger.info("Converting to mono WAV for VAD analysis")
+        wav_path = convert_to_mono_wav(source_path, dest_dir)
+        wav_is_owned = True
 
     logger.info("Running silero-vad")
     all_silences = _run_silero_vad(wav_path)
@@ -259,10 +279,11 @@ def chunk_audio(
         ))
         prev_end = end_time
 
-    try:
-        wav_path.unlink()
-    except OSError:
-        pass
+    if wav_is_owned:
+        try:
+            wav_path.unlink()
+        except OSError:
+            pass
 
     logger.info(
         "Chunking complete: %d chunks from %.1f min audio",
