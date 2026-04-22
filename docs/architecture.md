@@ -42,13 +42,13 @@ Target users: doctors, therapists, psychiatrists recording clinical sessions.
 │  │    3. Parallel transcription      │──► Sarvam Saaras v3      │
 │  │    4. Overlap speaker stitching   │                          │
 │  │    5. Translation                 │──► Sarvam Mayura v1      │
-│  │    6. Store results               │──► RDS PostgreSQL        │
-│  │    7. Publish completion event    │──► SQS job-events queue  │
+│  │    6. Write results JSON          │──► S3 (results/ prefix)  │
+│  │    7. Publish pointer event       │──► SQS job-events queue  │
 │  └───────────────────────────────────┘                          │
 │                                                                 │
-│  SQS job-events queue  ──► API backend / frontend / notifier    │
-│  RDS PostgreSQL (ISOLATED subnet)                               │
-│  S3 (processed/)                                                │
+│  SQS job-events queue  ──► Backend consumer (reads results JSON │
+│                             from S3 via pointer in the event)   │
+│  S3 bucket: uploads/ (input audio) + results/ (transcripts)     │
 └─────────────────────────────────────────────────────────────────┘
 ```
 
@@ -241,37 +241,96 @@ Observed impact on the Hinglish reference audio (1265 segments): remaining Indic
 
 ---
 
-### Stage 6 — Storage
+### Stage 6 — Results persistence (S3 claim-check)
 
-**File:** `job_status.py`, `models.py`
+**File:** `results_writer.py`
 
-Results stored in RDS PostgreSQL across three tables:
+The worker stores **nothing** in a database. Every finished job is serialized
+to one JSON object and PUT to
+`s3://${S3_PROCESSED_BUCKET}/${S3_RESULTS_PREFIX}<job_id>.json`
+(default prefix `results/`). The SQS completion event carries only a small
+pointer to that object (see Stage 7), so downstream consumers do **one S3
+GET** to read the full results.
 
-```sql
-jobs          — one row per audio file (status, duration, speaker count, errors)
-segments      — one row per merged speaker turn (speaker_id, start_time, end_time, text)
-translations  — one row per segment per language (translated_text)
+Why a claim-check over inlining in SQS:
+
+- SQS body limit is 1 MiB; long multi-speaker transcripts can exceed it.
+  Pointers are ~0.5 KiB and don't vary with audio length.
+- S3 gives durable, inspectable, replayable records. If an SQS message is
+  missed or the consumer is down, the backend can reconcile by listing the
+  `results/` prefix.
+- Any additional consumer (search indexer, analytics, export job) reads the
+  same object — results are never re-fanned out as big SQS payloads.
+
+**Schema (v1) — S3 results JSON:**
+
+```jsonc
+{
+  "schema_version": 1,
+  "job_id": "4f2e9a1c-7b8d-4e3a-a1f2-0c9d5e7b3f42",
+  "status": "completed",
+
+  "source": {
+    "bucket": "anchor-voice-prd-audio-...",
+    "key":    "uploads/2026-04-22/session-42.mp3",
+    "original_filename": "session-42.mp3"
+  },
+
+  "summary": {
+    "audio_duration_seconds": 3421.47,
+    "num_chunks": 2,
+    "num_segments": 287,
+    "num_speakers": 2,
+    "source_language": null
+  },
+
+  "timing": {
+    "started_at":   "2026-04-22T10:14:02.311Z",
+    "completed_at": "2026-04-22T10:31:45.827Z",
+    "wall_clock_seconds": 1063.52
+  },
+
+  "segments": [
+    {
+      "segment_index": 0,
+      "chunk_index": 0,
+      "speaker_id": 0,
+      "start_time": 0.000,
+      "end_time": 8.420,
+      "transcription": "Namaste doston, aaj ke episode mein hum…",
+      "translation":   "Hello friends, in today's episode we will…",
+      "confidence": 0.942
+    }
+    // … one entry per merged speaker turn
+  ]
+}
 ```
 
-The segment + translation inserts AND the `jobs.status → completed` transition
-happen in **one database transaction** (`store_results(..., final_status="completed")`).
-Consumers never see segments without the status update or a status update without
-the segments.
+Translation is always **English**, inlined per segment under the
+`translation` key. Segments whose batch failed carry `"translation": ""`.
+
+On **failure**, no results file is written — the failure event (Stage 7)
+carries the error message inline.
+
+Objects are written with `ContentType: application/json; charset=utf-8` and
+`ServerSideEncryption: AES256`.
 
 ---
 
-### Stage 7 — Completion event (fan-out notification)
+### Stage 7 — Completion event (claim-check pointer)
 
 **File:** `events.py`
 
-After RDS is committed, the worker publishes **one SQS message** to the
-`JOB_EVENTS_QUEUE_URL` queue — either `job.completed` or `job.failed`.
-Downstream services (API backend, frontend notifier, Slack bot) consume this
-queue instead of polling the `jobs` table.
+After the results JSON is written, the worker publishes **one SQS message**
+to the `JOB_EVENTS_QUEUE_URL` queue — either `job.completed` with a pointer
+into the results bucket, or `job.failed` with an inline error message.
+Downstream services (backend API, notifier, analytics) consume this queue;
+there is no database to poll.
 
-**Publish is best-effort**: RDS is the source of truth. A publish failure is
-logged and never fails the job. Consumers that miss an event can reconcile
-by scanning `jobs` where `status IN ('completed', 'failed')`.
+**Publish is best-effort.** The S3 results object is the durable record. A
+publish failure is logged and never fails the job — consumers that miss an
+event can reconcile by listing the `results/` prefix in the processed
+bucket.
 
 **FIFO-aware**: if the queue URL ends with `.fifo`, the publisher attaches
 `MessageGroupId=job_id` and `MessageDeduplicationId=job_id:status`, so a
@@ -280,32 +339,43 @@ retried publish is deduped by SQS automatically.
 **Schema:**
 
 ```jsonc
-// job.completed
+// job.completed — pointer only; full results in S3.
 {
   "event": "job.completed",
-  "job_id": "8f3c…",
+  "job_id": "4f2e9a1c-7b8d-4e3a-a1f2-0c9d5e7b3f42",
   "status": "completed",
-  "s3_bucket": "anchor-voice-uploads",
-  "s3_key": "uploads/session-42.mp3",
-  "original_filename": "session-42.mp3",
-  "audio_duration_seconds": 1234.5,
-  "num_chunks": 1,
-  "num_segments": 187,
-  "num_speakers": 3,
-  "target_languages": ["en-IN"],
-  "completed_at": "2026-04-19T07:45:12+00:00"
+  "source": {
+    "bucket": "anchor-voice-prd-audio-...",
+    "key":    "uploads/2026-04-22/session-42.mp3",
+    "original_filename": "session-42.mp3"
+  },
+  "results": {
+    "bucket":     "anchor-voice-prd-audio-...",
+    "key":        "results/4f2e9a1c-7b8d-4e3a-a1f2-0c9d5e7b3f42.json",
+    "size_bytes": 312847,
+    "etag":       "a1b2c3d4…"
+  },
+  "summary": {
+    "audio_duration_seconds": 3421.47,
+    "num_chunks": 2,
+    "num_segments": 287,
+    "num_speakers": 2
+  },
+  "completed_at": "2026-04-22T10:31:45+00:00"
 }
 
-// job.failed
+// job.failed — no results file exists; error inline.
 {
   "event": "job.failed",
-  "job_id": "8f3c…",
+  "job_id": "4f2e9a1c-7b8d-4e3a-a1f2-0c9d5e7b3f42",
   "status": "failed",
-  "s3_bucket": "anchor-voice-uploads",
-  "s3_key": "uploads/session-42.mp3",
-  "original_filename": "session-42.mp3",
-  "error_message": "Translation failure rate 12.3% for en-IN exceeds threshold 5.0%",
-  "failed_at": "2026-04-19T07:45:12+00:00"
+  "source": {
+    "bucket": "anchor-voice-prd-audio-...",
+    "key":    "uploads/2026-04-22/session-42.mp3",
+    "original_filename": "session-42.mp3"
+  },
+  "error_message": "Translation failure rate 12.3% for en exceeds threshold 5.0% (35/284 segments empty)",
+  "failed_at": "2026-04-22T10:22:14+00:00"
 }
 ```
 
@@ -315,12 +385,16 @@ retried publish is deduped by SQS automatically.
 import boto3, json
 
 sqs = boto3.client("sqs")
+s3  = boto3.client("s3")
+
 resp = sqs.receive_message(QueueUrl=EVENTS_URL, MaxNumberOfMessages=10, WaitTimeSeconds=20)
 for msg in resp.get("Messages", []):
     evt = json.loads(msg["Body"])
     if evt["event"] == "job.completed":
-        # e.g. fetch segments/translations from RDS and push to frontend
-        handle_completed(evt)
+        ptr = evt["results"]
+        obj = s3.get_object(Bucket=ptr["bucket"], Key=ptr["key"])
+        results = json.loads(obj["Body"].read())
+        handle_completed(evt, results)
     else:
         alert(evt)
     sqs.delete_message(QueueUrl=EVENTS_URL, ReceiptHandle=msg["ReceiptHandle"])
@@ -351,18 +425,19 @@ This is a sliding window (not a fixed 60s bucket), so the rate is smooth with no
 |-------|----------|
 | Sarvam 429 rate limit | Wait 60s explicitly, then retry via `@retry` |
 | Sarvam 5xx / network timeout | `@retry` exponential backoff (3–4 attempts, 5s–60s) |
-| Chunk transcription failure | Raises immediately — job marked `failed` in DB |
+| Chunk transcription failure | Raises immediately — job emits `job.failed` event, no results file written |
 | Translation batch split mismatch | Re-translate each segment individually |
 | Mayura 400 / input exceeds limit | Sentence-split (`।` / `.?!`), translate pieces, rejoin |
 | Auto language detection failure | Retry with `hi-IN` explicit source |
 | `en-IN` output still in Indic script (auto-detect passthrough) | Surgical retry with Lingua-picked Indic source (Hindi vs Marathi disambiguation, 11-language allow-list, 0.75 confidence floor), falls back to script-range regex; pre-split if >950 chars |
-| Translation segment failure | Empty string stored, pipeline continues |
+| Translation segment failure | Empty string in the segment's `translation` field, pipeline continues |
 | pyannote / diarization | Removed — not used. Sarvam provides per-chunk diarization |
 | Audio over 60 min | VAD chunking with overlap — no size limit |
 | Video file input | ffmpeg extracts audio-only before processing |
 | No silence gap found | Force-cut 60s before hard chunk limit |
 | SQS visibility timeout (long jobs) | Heartbeat thread extends visibility every 5 min |
-| Job stuck / crashed | Status readable from `jobs` table; error in `jobs.error_message` |
+| Job stuck / crashed | CloudWatch logs for the ECS task carry the structured error; input SQS message redelivers (up to `maxReceiveCount=3`) then lands in the DLQ |
+| Missed `job.completed` event | Reconcile by listing `s3://${S3_PROCESSED_BUCKET}/results/` — every completed job has a JSON object keyed by `<job_id>.json` |
 
 ---
 
@@ -374,7 +449,10 @@ pending → downloading → chunking → transcribing → merging → translatin
                                                                       failed
 ```
 
-Invalid transitions raise `ValueError` immediately — prevents silent data corruption.
+These states are emitted as **structured log lines** only — there is no
+database row tracking them. `completed` corresponds to a results JSON in S3
+plus a `job.completed` SQS event; `failed` corresponds to a `job.failed`
+SQS event with `error_message` (no results file).
 
 ---
 
@@ -394,8 +472,9 @@ Most options are environment variables:
 | `MAX_CHUNK_DURATION_S` | 2700 | Hard max chunk size (45 min) |
 | `OVERLAP_DURATION_S` | 120 | Overlap prefix for speaker stitching (2 min) |
 | `SILENCE_SEARCH_WINDOW_S` | 300 | VAD split search window (±5 min) |
-| `DATABASE_URL` | — | PostgreSQL connection string |
 | `AWS_REGION` | ap-south-1 | AWS region |
+| `S3_PROCESSED_BUCKET` | — | Bucket the worker PUTs the results JSON to. **Required** — the worker exits if unset. |
+| `S3_RESULTS_PREFIX` | `results/` | Key prefix inside the bucket. Each completed job writes `<prefix><job_id>.json`. |
 | `JOB_EVENTS_QUEUE_URL` | — | SQS queue for `job.completed` / `job.failed` events. Unset = no publish. Supports `.fifo` suffix. |
 | `TRANSLATION_FAILURE_THRESHOLD` | 0.05 | Max fraction of segments per language that may come back empty before the job is failed. |
 | `SQS_HEARTBEAT_INTERVAL_S` | 300 | How often the worker extends the input SQS message visibility. |
@@ -426,7 +505,7 @@ All metrics carry the dimension `Service=worker`. Translation metrics add
 | Metric | Unit | Emitted when | Dimensions |
 |---|---|---|---|
 | `JobCompleted` | Count | Pipeline finishes successfully | `Service` |
-| `JobFailed` | Count | Pipeline raises (after `mark_failed`) | `Service` |
+| `JobFailed` | Count | Pipeline raises (emitted from the failure handler before the `job.failed` SQS event) | `Service` |
 | `JobDurationSeconds` | Seconds | Both outcomes (wall-clock from `process_job` entry) | `Service` |
 | `AudioDurationSeconds` | Seconds | Both outcomes (0 if failed before `ffprobe`) | `Service` |
 | `SegmentsProcessed` | Count | Both outcomes | `Service` |
@@ -497,7 +576,7 @@ JSON shape — there is no additional configuration to wire up.
 
 ECS Fargate tasks run in **public subnets** with `assignPublicIp=ENABLED` — no NAT gateway needed, saving ~$32/month.
 
-RDS runs in **isolated subnets** accessible only from ECS via security group rules — never exposed to the internet.
+No database is provisioned — results are persisted as JSON objects in the same S3 bucket used for uploads (different prefix), so the only data plane the worker talks to is S3 + SQS + Sarvam.
 
 Only a free S3 Gateway endpoint is used (no Interface endpoints).
 
@@ -508,39 +587,28 @@ Only a free S3 Gateway endpoint is used (no Interface endpoints).
 ```bash
 # 1. Copy and fill env vars
 cp .env .env.local
-# Fill in: SARVAM_API_KEY, DATABASE_URL
+# Fill in: SARVAM_API_KEY
 
 # 2. Install dependencies
 cd worker && uv sync && cd ..
 
-# 3. Start local PostgreSQL
-make db-up
-
-# 4. Create tables — LOCAL DEV ONLY.
-# In AWS, the worker self-bootstraps on every container start via
-# pipeline.main → create_tables(), so this step is not needed on ECS.
-DATABASE_URL=postgresql://anchorvoice:anchorvoice@localhost:5432/anchorvoice \
-  uv run python scripts/init_db.py
-
-# 5. Run pipeline locally
-DATABASE_URL=postgresql://anchorvoice:anchorvoice@localhost:5432/anchorvoice \
-  uv run python scripts/run_local.py audio.mp3 --languages en
+# 3. Run pipeline locally (no DB, no AWS)
+make run-local f=audio.mp3
+# or:
+uv run python scripts/run_local.py audio.mp3
 ```
 
-> **Note on `scripts/`** — `scripts/init_db.py`, `scripts/run_local.py`, and
+> **Note on `scripts/`** — `scripts/run_local.py` and
 > `scripts/create_dashboard.sh` are **developer tools** that live at the repo
 > root, not inside `worker/`. They are deliberately *not* copied into the
-> Docker image (which has build context `worker/`). The production worker
-> doesn't need them — it bootstraps its own schema from `pipeline.db` on
-> every cold-start.
+> Docker image (which has build context `worker/`).
 
-`scripts/run_local.py` writes three sidecar files next to the input audio:
+`scripts/run_local.py` writes two sidecar files next to the input audio:
 
 | File | Contents |
 |---|---|
-| `<name>_transcript.txt` | Speaker-labelled transcript with `[HH:MM:SS]` stamps |
-| `<name>_translation_<lang>.txt` | One file per `--languages` target (same layout, translated text) |
-| stdout | Job id, speaker count, segment count |
+| `<name>_results.json` | Same schema the worker PUTs to S3 per job (see Stage 6) |
+| `<name>_transcript.txt` | Speaker-labelled transcript with `[MM:SS – MM:SS]` stamps plus the English translation |
 
 ## AWS Setup
 
@@ -548,7 +616,6 @@ End-to-end deploy is scripted — `scripts/deploy.sh` is idempotent and phase-ad
 
 ```bash
 export SARVAM_API_KEY='sk_...'
-export RDS_MASTER_PASSWORD='Strong!Pa55word'
 export AWS_REGION='ap-south-1'     # optional
 export ENV='prd'                   # optional — names all resources ${APP}-${ENV}-*
 make deploy                        # or: ./scripts/deploy.sh
@@ -566,21 +633,20 @@ Resources the script provisions (region defaults to `ap-south-1`):
 
 | Resource | Name | Purpose |
 |---|---|---|
-| S3 bucket | `${NS}-audio-${ACCOUNT}-${REGION}` | Audio uploads (`uploads/` prefix); SSE-S3, public access blocked |
+| S3 bucket | `${NS}-audio-${ACCOUNT}-${REGION}` | Audio uploads (`uploads/` prefix) and worker-written results (`results/` prefix); SSE-S3, public access blocked |
 | SQS FIFO — input | `${NS}-transcription-jobs.fifo` | Job queue; `VisibilityTimeout=900`, `maxReceiveCount=3`, content dedup |
 | SQS FIFO — DLQ | `${NS}-transcription-jobs-dlq.fifo` | Poison-message parking |
-| SQS FIFO — events | `${NS}-job-events.fifo` | `job.completed` / `job.failed` fan-out |
+| SQS FIFO — events | `${NS}-job-events.fifo` | `job.completed` (pointer) / `job.failed` (error) fan-out |
 | Lambda | `${NS}-job-dispatcher` | SQS-triggered ECS `RunTask` dispatcher with `ReportBatchItemFailures` |
 | ECS cluster + task def | `${NS}` / `${NS}-worker` | Fargate 2 vCPU / 8 GB (tune in `scripts/deploy.sh`) |
 | ECR | `${APP}/worker` | Worker Docker images, scan-on-push |
-| RDS PostgreSQL | `${NS}-postgres` | `db.t4g.micro`, gp3, encrypted, isolated SG |
-| Secrets Manager | `${APP}/${ENV}/sarvam-api-key`, `${APP}/${ENV}/rds-credentials` | Runtime credentials fetched by worker |
+| Secrets Manager | `${APP}/${ENV}/sarvam-api-key` | Runtime credentials fetched by worker |
 | CloudWatch log groups | `/ecs/${NS}-worker`, `/aws/lambda/${LAMBDA_NAME}` | 30-day retention |
 | CloudWatch dashboard | `${NS}` | EMF metrics + SQS/Lambda signals (see Observability) |
-| VPC | Default VPC | Public subnets for ECS (`assignPublicIp=ENABLED`), RDS reachable only from ECS SG |
-| Security groups | `${NS}-ecs`, `${NS}-rds` | RDS ingress `5432` only from ECS SG |
+| VPC | Default VPC | Public subnets for ECS (`assignPublicIp=ENABLED`) |
+| Security groups | `${NS}-ecs` | ECS task SG (egress only — all data plane is S3 + SQS + Sarvam) |
 
-Networking: ECS tasks use `assignPublicIp=ENABLED` in public subnets — no NAT gateway. RDS is reachable only from the ECS SG, never the internet.
+Networking: ECS tasks use `assignPublicIp=ENABLED` in public subnets — no NAT gateway, no RDS, no private subnets required.
 
 Send a test job:
 
@@ -595,6 +661,6 @@ aws logs tail /ecs/${NS}-worker --region ${AWS_REGION} --follow
 
 - Audio never leaves Sarvam's API and your AWS infrastructure
 - No external LLM receives patient data (speaker stitching is text-similarity only)
-- RDS encrypted at rest; S3 buckets private
+- S3 buckets are private with `BlockPublicAcls=true` and SSE-S3 encryption at rest; results JSONs are written with `ServerSideEncryption: AES256`
 - All AWS services used are HIPAA-eligible (requires BAA with AWS)
 - Sarvam data processing agreement required before production medical use

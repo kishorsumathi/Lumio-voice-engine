@@ -2,9 +2,12 @@
 Pipeline orchestrator — entry point for ECS Fargate worker.
 
 Receives a job message (from SQS via ECS task environment variables),
-orchestrates the full pipeline, and stores results in RDS PostgreSQL.
+orchestrates the full pipeline, writes the results JSON to S3, and
+publishes a pointer event to the completion queue. Nothing is persisted
+in a database — the backend consumes from the completion queue and reads
+the results object from S3.
 
-Pipeline stages (with status transitions):
+Pipeline stages (structured-log state transitions, not persisted):
   pending → downloading → chunking → transcribing → merging → translating → completed
                                                                           ↓ (on any error)
                                                                         failed
@@ -26,11 +29,10 @@ import structlog
 from .audio import convert_to_mono_wav, get_duration
 from .chunking import chunk_audio
 from .config import DEFAULT_TARGET_LANGUAGES, TRANSLATION_FAILURE_THRESHOLD
-from .db import create_tables, health_check
 from .events import publish_job_event
-from .job_status import create_job, mark_failed, store_results, update_status
 from .merger import merge
 from .metrics import emit_job_outcome, emit_translation_coverage
+from .results_writer import build_results_document, write_results
 from .s3 import download_audio, get_object_metadata
 from .transcription import transcribe_all_chunks
 from .translation import translate_segments
@@ -121,11 +123,15 @@ def process_job(
     """
     Run the full transcription pipeline for one audio file.
 
-    Returns the job UUID once complete (or raises on failure).
+    Returns the job UUID once complete (or raises on failure). Correlation-
+    only — the UUID is never persisted to a database; it's used as the S3
+    results key and as the SQS FIFO MessageGroupId / dedup key.
     """
     original_filename = Path(s3_key).name
-    job_id = create_job(s3_bucket, s3_key, original_filename)
+    job_id = uuid.uuid4()
+    started_at = datetime.now(timezone.utc)
     log = logger.bind(job_id=str(job_id), s3_key=s3_key)
+    log.info("Job accepted", status="pending", original_filename=original_filename)
 
     wall_start = time.monotonic()
     duration = 0.0
@@ -143,22 +149,19 @@ def process_job(
         work_dir = Path(tmp_str)
         try:
             # ── 1. Download ──────────────────────────────────────────────
-            update_status(job_id, "downloading")
-            log.info("Downloading audio")
+            log.info("status=downloading")
             audio_path = download_audio(s3_bucket, s3_key, work_dir)
 
             # Per-upload target languages override via S3 object metadata
-            # (set by the Streamlit UI on PutObject). Keeps EventBridge → SQS
-            # flow unchanged: no schema changes to the input message body.
+            # (set by the Streamlit UI on PutObject). Kept for parity with
+            # the old flow — in practice this product is English-only.
             meta = get_object_metadata(s3_bucket, s3_key)
             meta_langs_raw = meta.get("target-languages") or meta.get("Target-Languages")
             if meta_langs_raw:
                 meta_langs = [x.strip() for x in meta_langs_raw.split(",") if x.strip()]
                 if meta_langs:
-                    log.info(
-                        "Target languages from S3 metadata override env: %s",
-                        meta_langs,
-                    )
+                    log.info("Target languages from S3 metadata override env",
+                             languages=meta_langs)
                     target_languages = meta_langs
 
             # ── 2. Normalize to 16 kHz mono PCM WAV up-front ─────────────
@@ -177,28 +180,25 @@ def process_job(
             log.info("Audio ready", duration_s=round(duration, 1), filename=audio_path.name)
 
             # ── 3. Chunk ─────────────────────────────────────────────────
-            update_status(job_id, "chunking", audio_duration_seconds=round(duration, 2))
-            log.info("Chunking audio")
+            log.info("status=chunking", audio_duration_seconds=round(duration, 2))
             chunks = chunk_audio(audio_path, work_dir, already_normalized=True)
             num_chunks = len(chunks)
             log.info("Chunks created", count=num_chunks)
 
             # ── 4. Transcribe chunks (parallel) ───────────────────────────
-            update_status(job_id, "transcribing", num_chunks=num_chunks)
-            log.info("Transcribing chunks", num_chunks=num_chunks)
+            log.info("status=transcribing", num_chunks=num_chunks)
             transcript_segments = transcribe_all_chunks(chunks)
             log.info("Transcription complete", num_segments=len(transcript_segments))
 
             # ── 5. Merge + stitch speakers across chunks ──────────────────
-            update_status(job_id, "merging")
+            log.info("status=merging")
             merged = merge(chunks, transcript_segments)
             num_segments = len(merged)
             log.info("Merge complete", num_merged=num_segments)
 
             # ── 6. Translate ──────────────────────────────────────────────
             langs = target_languages or DEFAULT_TARGET_LANGUAGES
-            update_status(job_id, "translating")
-            log.info("Translating", languages=langs)
+            log.info("status=translating", languages=langs)
             translations = translate_segments(merged, langs)
 
             # Surface silent translation batch failures. translate_segments
@@ -231,37 +231,41 @@ def process_job(
                         f"({empty}/{nonempty_src} segments empty)"
                     )
 
-            # ── 7. Persist to RDS ─────────────────────────────────────────
-            segments_for_db = [
-                {
-                    "chunk_index": s.chunk_index,
-                    "segment_index": s.segment_index,
-                    "speaker_id": s.speaker_id,
-                    "start_time": s.start_time,
-                    "end_time": s.end_time,
-                    "text": s.text,
-                    "confidence": s.confidence,
-                }
-                for s in merged
-            ]
-            translations_for_db = {
-                lang: [
-                    {"segment_index": t.segment_index, "translated_text": t.translated_text}
-                    for t in trans_list
-                ]
-                for lang, trans_list in translations.items()
-            }
+            # ── 7. Assemble + persist results JSON to S3 ──────────────────
+            # Always English. translate_segments() normalizes "en" → "en-IN"
+            # internally (Sarvam's canonical code) and keys its return dict
+            # with the normalized code, so we must look up "en-IN" — not the
+            # unnormalized env value. Keep "en" as a belt-and-braces fallback
+            # in case someone wires a Mayura-only code straight through.
+            # If `langs` is empty (translation disabled via env),
+            # `translations` is {} and we inline "" per segment.
+            english = translations.get("en-IN") or translations.get("en") or []
             num_speakers = len(set(s.speaker_id for s in merged))
-            num_segments = len(merged)
-            store_results(
-                job_id,
-                segments_for_db,
-                translations_for_db,
-                num_speakers,
-                final_status="completed",
-            )
+            completed_at = datetime.now(timezone.utc)
 
-            log.info("Pipeline complete")
+            document = build_results_document(
+                job_id=job_id,
+                source_bucket=s3_bucket,
+                source_key=s3_key,
+                original_filename=original_filename,
+                audio_duration_seconds=duration,
+                num_chunks=num_chunks,
+                num_speakers=num_speakers,
+                source_language=None,  # Sarvam auto-detects; we don't surface it per-job yet
+                merged=merged,
+                english_translation=english,
+                started_at=started_at,
+                completed_at=completed_at,
+            )
+            results_location = write_results(job_id, document)
+
+            log.info(
+                "Results persisted",
+                status="completed",
+                results_bucket=results_location.bucket,
+                results_key=results_location.key,
+                results_size_bytes=results_location.size_bytes,
+            )
             _delete_sqs_message(queue_url, receipt_handle)
 
             emit_job_outcome(
@@ -273,33 +277,38 @@ def process_job(
                 num_chunks=num_chunks,
             )
 
-            # Best-effort notify. RDS has already committed; if this fails the
-            # consumer can still reconcile from the jobs table.
+            # Best-effort notify. The S3 results object is the durable record;
+            # if publish fails the consumer can reconcile by listing the
+            # results/ prefix in the processed bucket.
             publish_job_event(
                 "job.completed",
                 {
                     "job_id": str(job_id),
                     "status": "completed",
-                    "s3_bucket": s3_bucket,
-                    "s3_key": s3_key,
-                    "original_filename": original_filename,
-                    "audio_duration_seconds": round(duration, 2),
-                    "num_chunks": num_chunks,
-                    "num_segments": num_segments,
-                    "num_speakers": num_speakers,
-                    "target_languages": langs,
-                    "completed_at": datetime.now(timezone.utc).isoformat(),
+                    "source": {
+                        "bucket": s3_bucket,
+                        "key": s3_key,
+                        "original_filename": original_filename,
+                    },
+                    "results": {
+                        "bucket": results_location.bucket,
+                        "key": results_location.key,
+                        "size_bytes": results_location.size_bytes,
+                        "etag": results_location.etag,
+                    },
+                    "summary": {
+                        "audio_duration_seconds": round(duration, 2),
+                        "num_chunks": num_chunks,
+                        "num_segments": num_segments,
+                        "num_speakers": num_speakers,
+                    },
+                    "completed_at": completed_at.isoformat(),
                 },
             )
 
         except Exception as exc:
             tb = traceback.format_exc()
             log.error("Pipeline failed", error=str(exc), traceback=tb)
-            try:
-                mark_failed(job_id, tb)
-            except Exception as mark_exc:
-                log.error("mark_failed itself failed — job row may be stale",
-                          error=str(mark_exc))
             emit_job_outcome(
                 status="failed",
                 wall_clock_s=time.monotonic() - wall_start,
@@ -313,16 +322,17 @@ def process_job(
                 {
                     "job_id": str(job_id),
                     "status": "failed",
-                    "s3_bucket": s3_bucket,
-                    "s3_key": s3_key,
-                    "original_filename": original_filename,
+                    "source": {
+                        "bucket": s3_bucket,
+                        "key": s3_key,
+                        "original_filename": original_filename,
+                    },
                     "error_message": str(exc)[:1000],
                     "failed_at": datetime.now(timezone.utc).isoformat(),
                 },
             )
             # Do NOT delete the SQS message on failure — let SQS's visibility
-            # timeout + maxReceiveCount drive redelivery / DLQ. The job row is
-            # marked `failed` so re-runs will create a fresh row.
+            # timeout + maxReceiveCount drive redelivery / DLQ.
             raise
         finally:
             if heartbeat:
@@ -339,13 +349,20 @@ def main():
 
     The Lambda that launches this task injects job parameters as environment
     variables: S3_BUCKET, S3_KEY, TARGET_LANGUAGES, SQS_QUEUE_URL,
-    SQS_RECEIPT_HANDLE.
+    SQS_RECEIPT_HANDLE. `S3_PROCESSED_BUCKET` must be set on the task
+    definition — the worker writes the results JSON there.
     """
     s3_bucket = os.environ.get("S3_BUCKET")
     s3_key = os.environ.get("S3_KEY")
 
     if not s3_bucket or not s3_key:
         logger.error("Missing required env vars: S3_BUCKET, S3_KEY")
+        sys.exit(1)
+
+    if not os.environ.get("S3_PROCESSED_BUCKET"):
+        logger.error(
+            "Missing required env var: S3_PROCESSED_BUCKET — cannot persist results"
+        )
         sys.exit(1)
 
     target_languages_raw = os.environ.get("TARGET_LANGUAGES", "")
@@ -360,20 +377,6 @@ def main():
         s3_key=s3_key,
         target_languages=target_languages,
     )
-
-    if not health_check():
-        logger.error("Database health check failed — aborting")
-        sys.exit(1)
-
-    # Self-bootstrap the schema. Idempotent (SQLAlchemy create_all is a no-op
-    # if every table already exists) and cheap (~100ms). Keeps us out of the
-    # "someone forgot to init the DB" failure mode. Does NOT run ALTERs on
-    # existing tables — additive schema changes only.
-    try:
-        create_tables()
-    except Exception as e:
-        logger.error("Schema bootstrap failed — aborting", error=str(e))
-        sys.exit(1)
 
     try:
         job_id = process_job(

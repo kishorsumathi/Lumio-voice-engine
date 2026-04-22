@@ -1,15 +1,20 @@
 """
-Job-completion event publisher.
+Job-completion event publisher (claim-check pointer on success).
 
-The worker emits exactly one SQS message per job — either `job.completed` or
-`job.failed` — containing everything a consumer needs to decide whether to
-refresh its UI / fan-out notifications / kick off post-processing, without
-hitting the database first.
+The worker emits exactly one SQS message per job:
 
-The queue URL is taken from `JOB_EVENTS_QUEUE_URL`. If unset, publishing is
-a no-op (useful for local dev and for tasks that don't yet have the queue
-wired up). Publish failures are logged but never raise — the job row in RDS
-is the source of truth; the event is a notification, not the record.
+  job.completed — carries an S3 pointer (bucket + key + size + etag) to the
+                  results JSON the worker just wrote, plus a small summary
+                  (duration, segment/speaker counts, source language).
+
+  job.failed    — carries the error message inline; no S3 file is written on
+                  failure, so there is no pointer to include.
+
+The queue URL is taken from `JOB_EVENTS_QUEUE_URL`. If unset, publishing is a
+no-op (useful for local dev and for tasks that don't yet have the queue
+wired up). Publish failures on `job.completed` are logged but never raise —
+the results JSON has already been persisted to S3, so the consumer can
+reconcile by listing the `results/` prefix if an event is missed.
 
 FIFO queues are supported automatically: if the queue URL ends with `.fifo`,
 a `MessageGroupId` (= job_id) and `MessageDeduplicationId` (= job_id +
@@ -57,16 +62,16 @@ def publish_job_event(event: str, payload: dict) -> None:
     Publish a single `event` (e.g. "job.completed", "job.failed") with `payload`
     to the configured completion queue. No-op if the queue URL isn't set.
 
-    Never raises — failures are logged at WARNING. The RDS row is the
-    authoritative record; consumers that miss an event can reconcile by
-    polling `jobs` periodically.
+    Never raises — failures are logged at WARNING. On `job.completed`, the
+    results JSON on S3 is the durable record; a missed event can be recovered
+    by listing the `results/` prefix in the processed bucket.
     """
     if not JOB_EVENTS_QUEUE_URL:
         logger.debug("JOB_EVENTS_QUEUE_URL unset — skipping %s publish", event)
         return
 
     body = {"event": event, **payload}
-    message_body = json.dumps(body, default=_json_default)
+    message_body = json.dumps(body, default=_json_default, ensure_ascii=False)
 
     kwargs: dict[str, Any] = {
         "QueueUrl": JOB_EVENTS_QUEUE_URL,
@@ -81,8 +86,11 @@ def publish_job_event(event: str, payload: dict) -> None:
     try:
         resp = _sqs().send_message(**kwargs)
         logger.info(
-            "Published %s event: message_id=%s job_id=%s",
-            event, resp.get("MessageId"), payload.get("job_id"),
+            "Published %s event: message_id=%s job_id=%s size_bytes=%d",
+            event,
+            resp.get("MessageId"),
+            payload.get("job_id"),
+            len(message_body.encode("utf-8")),
         )
     except Exception as e:
         logger.warning(

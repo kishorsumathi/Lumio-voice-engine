@@ -16,9 +16,6 @@ dependencies = [
     # Audio manipulation
     "pydub>=0.25.1",
     "soundfile>=0.12.1",
-    # Database
-    "sqlalchemy>=2.0",
-    "psycopg2-binary>=2.9",
     # AWS
     "boto3>=1.34",
     # Retry logic

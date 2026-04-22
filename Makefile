@@ -1,11 +1,10 @@
-.PHONY: help install db-up db-down init-db worker-build worker-push run-local lint clean dashboard deploy deploy-image deploy-eventbridge deploy-ui deploy-ui-image ui-build ui-ip send-test
+.PHONY: help install worker-build worker-push run-local lint clean dashboard deploy deploy-image deploy-eventbridge deploy-ui deploy-ui-image ui-build ui-ip send-test
 
 REGION         ?= ap-south-1
 ACCOUNT_ID     := $(shell aws sts get-caller-identity --query Account --output text 2>/dev/null)
 # Must match scripts/deploy.sh (ECR_REPO="${APP}/worker" with APP=anchor-voice)
 ECR_REGISTRY   := $(ACCOUNT_ID).dkr.ecr.$(REGION).amazonaws.com
 ECR_IMAGE       := $(ECR_REGISTRY)/anchor-voice/worker
-DATABASE_URL   ?= postgresql://anchorvoice:anchorvoice@localhost:5432/anchorvoice
 
 DASHBOARD_NAME    ?= anchor-voice
 INPUT_QUEUE_NAME  ?= anchor-voice-jobs.fifo
@@ -16,17 +15,17 @@ help:
 	@echo ""
 	@echo "  Local development"
 	@echo "    make install        Install worker dependencies"
-	@echo "    make db-up          Start local PostgreSQL (Docker)"
-	@echo "    make db-down        Stop local PostgreSQL"
-	@echo "    make init-db        Create tables (idempotent, no migrations)"
 	@echo "    make run-local f=path/to/audio.mp3"
+	@echo "                        Runs the full pipeline locally. Requires"
+	@echo "                        SARVAM_API_KEY (env or .env). Writes"
+	@echo "                        <stem>_results.json + <stem>_transcript.txt."
 	@echo ""
 	@echo "  Docker / ECR"
 	@echo "    make worker-build   Build worker Docker image"
 	@echo "    make worker-push    Push image to ECR (repo: anchor-voice/worker)"
 	@echo ""
 	@echo "  Deployment (idempotent)"
-	@echo "    make deploy         Full deploy (SARVAM_API_KEY + RDS_MASTER_PASSWORD in env)"
+	@echo "    make deploy         Full deploy (requires SARVAM_API_KEY in env)"
 	@echo "    make deploy-image   Rebuild image + register new task def revision only"
 	@echo "    make deploy-eventbridge  Wire S3 uploads to input SQS via EventBridge"
 	@echo "    make deploy-ui      Deploy Streamlit UI (ECR + IAM + SG + ECS service, public IP)"
@@ -48,22 +47,9 @@ help:
 install:
 	cd worker && uv sync
 
-db-up:
-	docker run -d --name anchorvoice-pg -e POSTGRES_USER=anchorvoice -e POSTGRES_PASSWORD=anchorvoice -e POSTGRES_DB=anchorvoice -p 5432:5432 postgres:16-alpine
-	@echo "PostgreSQL ready on localhost:5432"
-
-db-down:
-	docker rm -f anchorvoice-pg 2>/dev/null || true
-	@echo "PostgreSQL container removed"
-
-init-db:
-	cd worker && DATABASE_URL=$(DATABASE_URL) \
-	  uv run python ../scripts/init_db.py
-
 run-local:
-	@test -n "$(f)" || (echo "Usage: make run-local f=path/to/audio.mp3 [langs=en,hi]" && exit 1)
-	cd worker && DATABASE_URL=$(DATABASE_URL) \
-	  uv run python ../scripts/run_local.py $(f) --languages $(or $(langs),en)
+	@test -n "$(f)" || (echo "Usage: make run-local f=path/to/audio.mp3" && exit 1)
+	cd worker && uv run python ../scripts/run_local.py $(f)
 
 # ── Docker / ECR ───────────────────────────────────────────────────────────────
 

@@ -1,24 +1,35 @@
 """
 Local pipeline runner — test the full pipeline without AWS.
 
+Runs transcription + English translation on a local audio file and writes:
+
+  <audio-stem>_results.json      Same schema the worker PUTs to S3 per job.
+  <audio-stem>_transcript.txt    Human-readable transcript (speaker, timestamps,
+                                 source line, English translation).
+
 Usage:
-    python scripts/run_local.py path/to/audio.mp3 [--languages en,hi]
+    python scripts/run_local.py path/to/audio.mp3
 
 Requires:
-    - DATABASE_URL env var pointing to a local PostgreSQL instance
-    - SARVAM_API_KEY env var
+    - SARVAM_API_KEY env var (or .env with SARVAM_API_KEY=...)
 """
+from __future__ import annotations
+
 import argparse
-import os
+import json
+import logging
+import shutil
 import sys
+import tempfile
+import traceback
 import uuid
+from datetime import datetime, timezone
 from pathlib import Path
 
-# Add worker/src to path
 sys.path.insert(0, str(Path(__file__).parent.parent / "worker" / "src"))
 
-import logging
-from dotenv import load_dotenv
+from dotenv import load_dotenv  # noqa: E402
+
 load_dotenv()
 
 logging.basicConfig(
@@ -28,18 +39,13 @@ logging.basicConfig(
     datefmt="%H:%M:%S",
 )
 
-from pipeline.audio import convert_to_mono_wav, get_duration
-from pipeline.chunking import chunk_audio
-from pipeline.db import create_tables, health_check
-from pipeline.job_status import create_job, mark_failed, store_results, update_status
-from pipeline.merger import merge
-from pipeline.s3 import _MP4_REMAP
-from pipeline.transcription import transcribe_all_chunks
-from pipeline.translation import translate_segments
-
-import tempfile
-import shutil
-import traceback
+from pipeline.audio import convert_to_mono_wav, get_duration  # noqa: E402
+from pipeline.chunking import chunk_audio  # noqa: E402
+from pipeline.merger import merge  # noqa: E402
+from pipeline.results_writer import build_results_document  # noqa: E402
+from pipeline.s3 import _MP4_REMAP  # noqa: E402
+from pipeline.transcription import transcribe_all_chunks  # noqa: E402
+from pipeline.translation import translate_segments  # noqa: E402
 
 
 def _segment_timestamp(seg) -> str:
@@ -49,85 +55,46 @@ def _segment_timestamp(seg) -> str:
     )
 
 
-def write_output(audio_path: Path, merged, translations: dict, output_path: Path) -> None:
-    lines = []
-    lines.append(f"Anchor-Voice Transcript — {audio_path.name}")
-    lines.append("=" * 70)
-    lines.append("")
-
-    langs = list(translations.keys())
-
+def write_transcript_txt(audio_path: Path, merged, english_by_index: dict, output_path: Path) -> None:
+    lines = [
+        f"Anchor-Voice Transcript — {audio_path.name}",
+        "=" * 70,
+        "",
+    ]
     for seg in merged:
         ts = _segment_timestamp(seg)
         lines.append(f"Speaker {seg.speaker_id}  {ts}")
         lines.append(f"  {seg.text}")
-        for lang in langs:
-            t = translations[lang][seg.segment_index]
-            if t.translated_text:
-                lines.append(f"  [{lang}] {t.translated_text}")
+        translated = english_by_index.get(seg.segment_index, "")
+        if translated:
+            lines.append(f"  [en] {translated}")
         lines.append("")
-
     output_path.write_text("\n".join(lines), encoding="utf-8")
     print(f"\nTranscript saved → {output_path}")
 
 
-def write_translation_only_files(audio_path: Path, merged, translations: dict) -> None:
-    """
-    One .txt per target language: same Speaker + timestamp layout as the combined
-    transcript, but only the translated line per segment (local runner only).
-    """
-    out_dir = audio_path.parent
-    stem = audio_path.stem
-    for lang, trans_list in translations.items():
-        lang_slug = lang.replace("/", "_").replace(" ", "_")
-        path = out_dir / f"{stem}_translation_{lang_slug}.txt"
-        lines = [
-            f"Anchor-Voice Translation ({lang}) — {audio_path.name}",
-            "=" * 70,
-            "",
-        ]
-        for seg in merged:
-            t = trans_list[seg.segment_index]
-            ts = _segment_timestamp(seg)
-            lines.append(f"Speaker {seg.speaker_id}  {ts}")
-            lines.append(f"  {t.translated_text}")
-            lines.append("")
-        path.write_text("\n".join(lines), encoding="utf-8")
-        print(f"Translation saved → {path}")
-
-
-def run(audio_path: Path, target_languages: list[str]) -> None:
+def run(audio_path: Path) -> None:
     print(f"\n{'='*60}")
     print(f"  Anchor-Voice Local Pipeline Runner")
     print(f"  File: {audio_path.name}")
-    print(f"  Languages: {target_languages}")
     print(f"{'='*60}\n")
 
-    if not health_check():
-        print("ERROR: Cannot connect to database. Check DATABASE_URL.")
-        sys.exit(1)
-
-    create_tables()
-
-    # Fake S3 reference for local run
-    job_id = create_job("local", str(audio_path), audio_path.name)
+    job_id = uuid.uuid4()
+    started_at = datetime.now(timezone.utc)
     print(f"Job ID: {job_id}")
 
     with tempfile.TemporaryDirectory() as tmp_str:
         work_dir = Path(tmp_str)
         try:
-            # Copy file to work dir (simulates S3 download)
             local_audio = work_dir / audio_path.name
             shutil.copy2(str(audio_path), str(local_audio))
 
-            # Handle .mp4 → .m4a rename
             ext = local_audio.suffix.lower()
             if ext in _MP4_REMAP:
                 renamed = local_audio.with_suffix(_MP4_REMAP[ext])
                 local_audio.rename(renamed)
                 local_audio = renamed
 
-            update_status(job_id, "downloading")
             # Normalize to 16 kHz mono PCM WAV up-front — same contract as
             # the production worker (guarantees a readable RIFF duration
             # header even for browser MediaRecorder WebM, handles video
@@ -140,19 +107,16 @@ def run(audio_path: Path, target_languages: list[str]) -> None:
                 )
             print(f"Duration: {duration:.1f}s ({duration/60:.1f} min)")
 
-            update_status(job_id, "chunking", audio_duration_seconds=round(duration, 2))
             chunks = chunk_audio(local_audio, work_dir, already_normalized=True)
             print(f"Chunks: {len(chunks)}")
             for c in chunks:
                 print(f"  [{c.index}] {c.start_time:.1f}s–{c.end_time:.1f}s "
                       f"({c.duration/60:.1f}min) [{c.split_reason}]")
 
-            update_status(job_id, "transcribing", num_chunks=len(chunks))
             print("\nTranscribing chunks...")
             transcript_segs = transcribe_all_chunks(chunks)
             print(f"Transcript segments: {len(transcript_segs)}")
 
-            update_status(job_id, "merging")
             merged = merge(chunks, transcript_segs)
             print(f"\nMerged segments: {len(merged)}")
             print("\n--- Transcript Preview ---")
@@ -161,44 +125,46 @@ def run(audio_path: Path, target_languages: list[str]) -> None:
             if len(merged) > 10:
                 print(f"  ... ({len(merged) - 10} more segments)")
 
-            update_status(job_id, "translating")
-            print(f"\nTranslating {len(merged)} segments → {target_languages}...")
-            translations = translate_segments(merged, target_languages)
-            for lang, segs in translations.items():
-                non_empty = sum(1 for t in segs if t.translated_text)
-                print(f"  {lang}: {non_empty}/{len(segs)} segments translated")
+            print(f"\nTranslating {len(merged)} segments → en...")
+            translations = translate_segments(merged, ["en"])
+            english = translations.get("en", [])
+            non_empty = sum(1 for t in english if t.translated_text)
+            print(f"  en: {non_empty}/{len(english)} segments translated")
 
-            segments_for_db = [
-                {
-                    "chunk_index": s.chunk_index,
-                    "segment_index": s.segment_index,
-                    "speaker_id": s.speaker_id,
-                    "start_time": s.start_time,
-                    "end_time": s.end_time,
-                    "text": s.text,
-                    "confidence": s.confidence,
-                }
-                for s in merged
-            ]
-            translations_for_db = {
-                lang: [{"segment_index": t.segment_index, "translated_text": t.translated_text}
-                       for t in trans_list]
-                for lang, trans_list in translations.items()
-            }
             num_speakers = len(set(s.speaker_id for s in merged))
-            store_results(job_id, segments_for_db, translations_for_db, num_speakers)
-            update_status(job_id, "completed", num_speakers=num_speakers)
+            completed_at = datetime.now(timezone.utc)
 
-            output_path = audio_path.parent / (audio_path.stem + "_transcript.txt")
-            write_output(audio_path, merged, translations, output_path)
-            write_translation_only_files(audio_path, merged, translations)
+            document = build_results_document(
+                job_id=job_id,
+                source_bucket="local",
+                source_key=str(audio_path),
+                original_filename=audio_path.name,
+                audio_duration_seconds=duration,
+                num_chunks=len(chunks),
+                num_speakers=num_speakers,
+                source_language=None,
+                merged=merged,
+                english_translation=english,
+                started_at=started_at,
+                completed_at=completed_at,
+            )
+
+            json_path = audio_path.parent / f"{audio_path.stem}_results.json"
+            json_path.write_text(
+                json.dumps(document, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+            print(f"\nResults JSON saved → {json_path}")
+
+            txt_path = audio_path.parent / f"{audio_path.stem}_transcript.txt"
+            english_by_index = {t.segment_index: t.translated_text for t in english}
+            write_transcript_txt(audio_path, merged, english_by_index, txt_path)
 
             print(f"\n✓ Pipeline complete. Job ID: {job_id}")
             print(f"  Speakers: {num_speakers}  Segments: {len(merged)}")
 
         except Exception as e:
             tb = traceback.format_exc()
-            mark_failed(job_id, tb)
             print(f"\n✗ Pipeline failed: {e}")
             print(tb)
             sys.exit(1)
@@ -207,10 +173,6 @@ def run(audio_path: Path, target_languages: list[str]) -> None:
 def main():
     parser = argparse.ArgumentParser(description="Run Anchor-Voice pipeline locally")
     parser.add_argument("audio_file", help="Path to audio file")
-    parser.add_argument(
-        "--languages", default="en",
-        help="Comma-separated target language codes (default: en)"
-    )
     args = parser.parse_args()
 
     audio_path = Path(args.audio_file)
@@ -218,8 +180,7 @@ def main():
         print(f"ERROR: File not found: {audio_path}")
         sys.exit(1)
 
-    target_languages = [l.strip() for l in args.languages.split(",") if l.strip()]
-    run(audio_path, target_languages)
+    run(audio_path)
 
 
 if __name__ == "__main__":

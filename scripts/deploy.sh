@@ -10,7 +10,6 @@
 #
 # Usage:
 #   export SARVAM_API_KEY='sk_...'
-#   export RDS_MASTER_PASSWORD='Strong!Pa55word'
 #   export AWS_REGION='ap-south-1'         # optional, default below
 #   export ENV='prd'                       # optional, default 'prd'
 #   ./scripts/deploy.sh                    # full deploy
@@ -24,7 +23,6 @@ IFS=$'\n\t'
 
 # ── Required inputs ──────────────────────────────────────────────────────────
 : "${SARVAM_API_KEY:?export SARVAM_API_KEY before running}"
-: "${RDS_MASTER_PASSWORD:?export RDS_MASTER_PASSWORD before running (strong password, 16+ chars)}"
 : "${AWS_REGION:=ap-south-1}"
 : "${ENV:=prd}"
 : "${APP:=anchor-voice}"
@@ -34,10 +32,10 @@ NS="${APP}-${ENV}"
 AWS_ACCOUNT_ID="$(aws sts get-caller-identity --query Account --output text)"
 
 ECR_REPO="${APP}/worker"
+# Single S3 bucket, two logical prefixes: `uploads/` for input audio,
+# `results/` for the claim-check results JSON the worker writes per job.
 S3_BUCKET="${NS}-audio-${AWS_ACCOUNT_ID}-${AWS_REGION}"
-DB_NAME="anchorvoice"
-DB_USER="anchorvoice"
-RDS_ID="${NS}-postgres"
+S3_RESULTS_PREFIX="results/"
 INPUT_QUEUE="${NS}-transcription-jobs.fifo"
 DLQ="${NS}-transcription-jobs-dlq.fifo"
 EVENTS_QUEUE="${NS}-job-events.fifo"
@@ -48,7 +46,6 @@ LOG_GROUP_WORKER="/ecs/${NS}-worker"
 LAMBDA_NAME="${NS}-job-dispatcher"
 LOG_GROUP_LAMBDA="/aws/lambda/${LAMBDA_NAME}"
 SARVAM_SECRET_NAME="${APP}/${ENV}/sarvam-api-key"
-RDS_SECRET_NAME="${APP}/${ENV}/rds-credentials"
 EXEC_ROLE="${NS}-ecs-execution-role"
 TASK_ROLE="${NS}-worker-task-role"
 LAMBDA_ROLE="${NS}-job-dispatcher-role"
@@ -145,65 +142,27 @@ load_network_state() {
     return
   fi
   warn "No ${STATE_DIR}/network.env — querying AWS for VPC / subnet / SG"
+  # IMPORTANT: variable names must match phase_network (SUBNETS, ECS_SG).
+  # Any mismatch here leaves downstream phases with unbound-variable errors
+  # under `set -u` (e.g. phase_lambda referencing ${SUBNETS}).
   VPC_ID="$(aws ec2 describe-vpcs --region "${AWS_REGION}" \
     --filters Name=isDefault,Values=true --query 'Vpcs[0].VpcId' --output text)"
-  SUBNET_IDS="$(aws ec2 describe-subnets --region "${AWS_REGION}" \
-    --filters "Name=vpc-id,Values=${VPC_ID}" \
-    --query 'Subnets[?MapPublicIpOnLaunch==`true`].SubnetId' --output text | tr '\t' ',')"
-  WORKER_SG_ID="$(aws ec2 describe-security-groups --region "${AWS_REGION}" \
-    --filters "Name=group-name,Values=${NS}-worker-sg" "Name=vpc-id,Values=${VPC_ID}" \
+  SUBNETS="$(aws ec2 describe-subnets --region "${AWS_REGION}" \
+    --filters Name=vpc-id,Values="${VPC_ID}" Name=default-for-az,Values=true \
+    --query 'Subnets[].SubnetId' --output text | tr '\t' ',')"
+  ECS_SG="$(aws ec2 describe-security-groups --region "${AWS_REGION}" \
+    --filters Name=vpc-id,Values="${VPC_ID}" Name=group-name,Values="${NS}-ecs" \
     --query 'SecurityGroups[0].GroupId' --output text 2>/dev/null || echo '')"
-  export VPC_ID SUBNET_IDS WORKER_SG_ID
-}
-
-# Add ingress on PostgreSQL port from the UI task SG to whichever SG(s) the RDS
-# instance actually uses. Order: (1) active VpcSecurityGroups from
-# describe-db-instances — source of truth when the SG isn't named ${NS}-rds;
-# (2) fallback to EC2 filter group-name=${NS}-rds in the given VPC (pre-RDS deploy).
-authorize_ui_to_rds() {
-  local UI_SG="$1"
-  local VPC_ID="$2"
-  local sg_ids=()
-  local g out rc
-
-  local rds_sgs
-  rds_sgs="$(aws rds describe-db-instances --region "${AWS_REGION}" \
-    --db-instance-identifier "${RDS_ID}" \
-    --query 'DBInstances[0].VpcSecurityGroups[?Status==`active`].VpcSecurityGroupId' \
-    --output text 2>/dev/null || true)"
-  if [[ -n "${rds_sgs}" && "${rds_sgs}" != "None" ]]; then
-    for g in ${rds_sgs}; do
-      [[ -n "${g}" ]] && sg_ids+=("${g}")
-    done
+  if [[ -z "${SUBNETS}" || -z "${ECS_SG}" || "${ECS_SG}" == "None" ]]; then
+    die "Network state missing (SUBNETS='${SUBNETS}', ECS_SG='${ECS_SG}'). Run './scripts/deploy.sh network' first."
   fi
-
-  if [[ ${#sg_ids[@]} -eq 0 ]]; then
-    local by_name
-    by_name="$(aws ec2 describe-security-groups --region "${AWS_REGION}" \
-      --filters "Name=vpc-id,Values=${VPC_ID}" "Name=group-name,Values=${NS}-rds" \
-      --query 'SecurityGroups[0].GroupId' --output text 2>/dev/null || echo 'None')"
-    if [[ -n "${by_name}" && "${by_name}" != "None" ]]; then
-      sg_ids+=("${by_name}")
-    fi
-  fi
-
-  if [[ ${#sg_ids[@]} -eq 0 ]]; then
-    warn "Could not resolve RDS security groups (instance ${RDS_ID} not found or has no active SGs, and no ${NS}-rds in VPC ${VPC_ID}). Add ingress: ${UI_SG} → TCP 5432 on the DB security group(s)."
-    return 1
-  fi
-
-  for g in "${sg_ids[@]}"; do
-    out="$(aws ec2 authorize-security-group-ingress --region "${AWS_REGION}" \
-      --group-id "${g}" --protocol tcp --port 5432 \
-      --source-group "${UI_SG}" 2>&1)" && rc=0 || rc=$?
-    if (( rc == 0 )); then
-      ok "RDS SG ingress: ${UI_SG} → ${g}:5432"
-    elif echo "${out}" | grep -qiE 'already exists|Duplicate|InvalidPermission\.Duplicate'; then
-      ok "RDS SG ingress already present: ${UI_SG} → ${g}:5432"
-    else
-      warn "Could not add ${UI_SG} → ${g}:5432 — ${out}"
-    fi
-  done
+  # Cache so subsequent phases in this invocation don't re-query.
+  cat > "${STATE_DIR}/network.env" <<EOF
+export VPC_ID="${VPC_ID}"
+export SUBNETS="${SUBNETS}"
+export ECS_SG="${ECS_SG}"
+EOF
+  export VPC_ID SUBNETS ECS_SG
 }
 
 phase_ecr() {
@@ -249,14 +208,6 @@ phase_storage() {
       --secret-string "${SARVAM_API_KEY}" >/dev/null
   fi
   ok "Secret: ${SARVAM_SECRET_NAME}"
-
-  # RDS secret: placeholder host on first run, replaced by phase_rds.
-  if ! aws secretsmanager describe-secret --secret-id "${RDS_SECRET_NAME}" --region "${AWS_REGION}" >/dev/null 2>&1; then
-    aws secretsmanager create-secret --region "${AWS_REGION}" \
-      --name "${RDS_SECRET_NAME}" \
-      --secret-string "{\"username\":\"${DB_USER}\",\"password\":\"${RDS_MASTER_PASSWORD}\",\"host\":\"PLACEHOLDER\",\"port\":5432,\"dbname\":\"${DB_NAME}\"}" >/dev/null
-    ok "Secret stub: ${RDS_SECRET_NAME} (host filled in by phase_rds)"
-  fi
 }
 
 phase_network() {
@@ -284,72 +235,12 @@ phase_network() {
   fi
   ok "ECS SG: ${ECS_SG}"
 
-  # RDS SG
-  RDS_SG="$(aws ec2 describe-security-groups --region "${AWS_REGION}" \
-    --filters Name=vpc-id,Values="${VPC_ID}" Name=group-name,Values="${NS}-rds" \
-    --query 'SecurityGroups[0].GroupId' --output text 2>/dev/null || echo 'None')"
-  if [[ "${RDS_SG}" == "None" ]]; then
-    RDS_SG="$(aws ec2 create-security-group --region "${AWS_REGION}" --vpc-id "${VPC_ID}" \
-      --group-name "${NS}-rds" --description "${NS} RDS" \
-      --query GroupId --output text)"
-  fi
-  aws ec2 authorize-security-group-ingress --region "${AWS_REGION}" \
-    --group-id "${RDS_SG}" --protocol tcp --port 5432 \
-    --source-group "${ECS_SG}" >/dev/null 2>&1 || true
-  ok "RDS SG: ${RDS_SG}"
-
   # Persist for later phases.
   cat > "${STATE_DIR}/network.env" <<EOF
 export VPC_ID="${VPC_ID}"
 export SUBNETS="${SUBNETS}"
 export ECS_SG="${ECS_SG}"
-export RDS_SG="${RDS_SG}"
 EOF
-}
-
-phase_rds() {
-  log "Phase: RDS"
-  # shellcheck disable=SC1091
-  source "${STATE_DIR}/network.env"
-
-  if ! aws rds describe-db-subnet-groups --region "${AWS_REGION}" \
-       --db-subnet-group-name "${NS}-db-subnets" >/dev/null 2>&1; then
-    # shellcheck disable=SC2086
-    aws rds create-db-subnet-group --region "${AWS_REGION}" \
-      --db-subnet-group-name "${NS}-db-subnets" \
-      --db-subnet-group-description "${NS} db subnets" \
-      --subnet-ids $(echo "${SUBNETS}" | tr ',' ' ') >/dev/null
-  fi
-
-  if ! aws rds describe-db-instances --region "${AWS_REGION}" \
-       --db-instance-identifier "${RDS_ID}" >/dev/null 2>&1; then
-    aws rds create-db-instance --region "${AWS_REGION}" \
-      --db-instance-identifier "${RDS_ID}" \
-      --db-instance-class db.t4g.micro \
-      --engine postgres --engine-version 16.3 \
-      --master-username "${DB_USER}" \
-      --master-user-password "${RDS_MASTER_PASSWORD}" \
-      --allocated-storage 20 --storage-type gp3 \
-      --db-name "${DB_NAME}" \
-      --db-subnet-group-name "${NS}-db-subnets" \
-      --vpc-security-group-ids "${RDS_SG}" \
-      --backup-retention-period 7 \
-      --no-publicly-accessible \
-      --storage-encrypted >/dev/null
-    warn "RDS creating — ~10 min"
-  fi
-
-  aws rds wait db-instance-available --region "${AWS_REGION}" --db-instance-identifier "${RDS_ID}"
-
-  RDS_HOST="$(aws rds describe-db-instances --region "${AWS_REGION}" \
-    --db-instance-identifier "${RDS_ID}" \
-    --query 'DBInstances[0].Endpoint.Address' --output text)"
-  ok "RDS: ${RDS_HOST}"
-
-  aws secretsmanager put-secret-value --region "${AWS_REGION}" \
-    --secret-id "${RDS_SECRET_NAME}" \
-    --secret-string "{\"username\":\"${DB_USER}\",\"password\":\"${RDS_MASTER_PASSWORD}\",\"host\":\"${RDS_HOST}\",\"port\":5432,\"dbname\":\"${DB_NAME}\"}" >/dev/null
-  ok "Secret updated with real RDS host"
 }
 
 phase_sqs() {
@@ -441,7 +332,8 @@ phase_iam() {
   "Statement": [
     {"Sid":"ReadAudioFromS3","Effect":"Allow","Action":["s3:GetObject","s3:HeadObject"],"Resource":"arn:aws:s3:::${S3_BUCKET}/*"},
     {"Sid":"ListAudioBucket","Effect":"Allow","Action":["s3:ListBucket"],"Resource":"arn:aws:s3:::${S3_BUCKET}"},
-    {"Sid":"ReadSecrets","Effect":"Allow","Action":["secretsmanager:GetSecretValue"],"Resource":["arn:aws:secretsmanager:${AWS_REGION}:${AWS_ACCOUNT_ID}:secret:${SARVAM_SECRET_NAME}-*","arn:aws:secretsmanager:${AWS_REGION}:${AWS_ACCOUNT_ID}:secret:${RDS_SECRET_NAME}-*"]},
+    {"Sid":"WriteResultsToS3","Effect":"Allow","Action":["s3:PutObject"],"Resource":"arn:aws:s3:::${S3_BUCKET}/${S3_RESULTS_PREFIX}*"},
+    {"Sid":"ReadSarvamSecret","Effect":"Allow","Action":["secretsmanager:GetSecretValue"],"Resource":"arn:aws:secretsmanager:${AWS_REGION}:${AWS_ACCOUNT_ID}:secret:${SARVAM_SECRET_NAME}-*"},
     {"Sid":"InputQueueLifecycle","Effect":"Allow","Action":["sqs:ChangeMessageVisibility","sqs:DeleteMessage","sqs:GetQueueAttributes"],"Resource":"${INPUT_QUEUE_ARN}"},
     {"Sid":"PublishCompletionEvents","Effect":"Allow","Action":["sqs:SendMessage"],"Resource":"${EVENTS_QUEUE_ARN}"},
     {"Sid":"WriteLogs","Effect":"Allow","Action":["logs:CreateLogStream","logs:PutLogEvents"],"Resource":"arn:aws:logs:${AWS_REGION}:${AWS_ACCOUNT_ID}:log-group:${LOG_GROUP_WORKER}:*"}
@@ -513,8 +405,8 @@ phase_ecs() {
     "environment": [
       {"name": "AWS_REGION",                   "value": "${AWS_REGION}"},
       {"name": "S3_PROCESSED_BUCKET",          "value": "${S3_BUCKET}"},
+      {"name": "S3_RESULTS_PREFIX",            "value": "${S3_RESULTS_PREFIX}"},
       {"name": "SARVAM_SECRET_NAME",           "value": "${SARVAM_SECRET_NAME}"},
-      {"name": "RDS_SECRET_NAME",              "value": "${RDS_SECRET_NAME}"},
       {"name": "JOB_EVENTS_QUEUE_URL",         "value": "${EVENTS_QUEUE_URL}"},
       {"name": "DEFAULT_TARGET_LANGUAGES",     "value": "en"},
       {"name": "SARVAM_RPM_LIMIT",             "value": "100"},
@@ -610,8 +502,12 @@ EOF
       --function-name "${LAMBDA_NAME}" \
       --zip-file fileb:///tmp/deploy-dispatcher.zip >/dev/null
     aws lambda wait function-updated --region "${AWS_REGION}" --function-name "${LAMBDA_NAME}"
+    # Sync role on every run — protects against drift where the Lambda was
+    # created under a legacy role name and phase_iam has since granted
+    # iam:PassRole to a differently-named role. Also re-applies env changes.
     aws lambda update-function-configuration --region "${AWS_REGION}" \
       --function-name "${LAMBDA_NAME}" \
+      --role "${LAMBDA_ROLE_ARN}" \
       --environment file:///tmp/deploy-lambda-env.json >/dev/null
     aws lambda wait function-updated --region "${AWS_REGION}" --function-name "${LAMBDA_NAME}"
   else
@@ -790,9 +686,11 @@ phase_ui() {
     --cidr 0.0.0.0/0 >/dev/null 2>&1 || true
   ok "UI SG: ${UI_SG} (ingress 0.0.0.0/0:${UI_PORT})"
 
-  authorize_ui_to_rds "${UI_SG}" "${VPC_ID}"
-
-  # ── 3. UI task role (S3 upload + presign, RDS secret, logs) ───────────────
+  # ── 3. UI task role (S3 upload + presign, list + read results, logs) ─────
+  # The UI is fully S3-backed: it uploads audio under uploads/, lists the
+  # results/ prefix, HEAD/GETs individual result JSONs, and presigns audio
+  # URLs for playback. No RDS access — everything downstream of the worker
+  # reads `s3://${S3_BUCKET}/results/<job_id>.json` directly.
   local assume_ecs='{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"Service":"ecs-tasks.amazonaws.com"},"Action":"sts:AssumeRole"}]}'
   idempotent aws iam create-role --role-name "${UI_TASK_ROLE}" \
     --assume-role-policy-document "${assume_ecs}" >/dev/null
@@ -804,7 +702,6 @@ phase_ui() {
     {"Sid":"UploadToS3","Effect":"Allow","Action":["s3:PutObject","s3:PutObjectTagging"],"Resource":"arn:aws:s3:::${S3_BUCKET}/uploads/*"},
     {"Sid":"PresignFromS3","Effect":"Allow","Action":["s3:GetObject"],"Resource":"arn:aws:s3:::${S3_BUCKET}/*"},
     {"Sid":"ListBucket","Effect":"Allow","Action":["s3:ListBucket"],"Resource":"arn:aws:s3:::${S3_BUCKET}"},
-    {"Sid":"ReadRdsSecret","Effect":"Allow","Action":["secretsmanager:GetSecretValue"],"Resource":"arn:aws:secretsmanager:${AWS_REGION}:${AWS_ACCOUNT_ID}:secret:${RDS_SECRET_NAME}-*"},
     {"Sid":"WriteLogs","Effect":"Allow","Action":["logs:CreateLogStream","logs:PutLogEvents"],"Resource":"arn:aws:logs:${AWS_REGION}:${AWS_ACCOUNT_ID}:log-group:${UI_LOG_GROUP}:*"}
   ]
 }
@@ -848,8 +745,8 @@ EOF
     "portMappings":[{"containerPort":${UI_PORT},"protocol":"tcp"}],
     "environment":[
       {"name":"AWS_REGION","value":"${AWS_REGION}"},
-      {"name":"RDS_SECRET_NAME","value":"${RDS_SECRET_NAME}"},
-      {"name":"S3_PROCESSED_BUCKET","value":"${S3_BUCKET}"}
+      {"name":"S3_PROCESSED_BUCKET","value":"${S3_BUCKET}"},
+      {"name":"S3_RESULTS_PREFIX","value":"${S3_RESULTS_PREFIX}"}
     ],
     "logConfiguration":{
       "logDriver":"awslogs",
@@ -1036,7 +933,6 @@ case "${PHASE}" in
   ecr)       phase_ecr ;;
   storage)   phase_storage ;;
   network)   phase_network ;;
-  rds)       phase_rds ;;
   sqs)       phase_sqs ;;
   logs)      phase_logs ;;
   iam)       phase_iam ;;
@@ -1052,7 +948,6 @@ case "${PHASE}" in
     phase_network
     phase_storage
     phase_ecr
-    phase_rds
     phase_sqs
     phase_logs
     phase_iam

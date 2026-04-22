@@ -1,5 +1,4 @@
 """Pipeline configuration loaded from environment variables + AWS Secrets Manager."""
-import json
 import logging
 import os
 
@@ -22,6 +21,8 @@ SARVAM_BATCH_POLL_INTERVAL_S: int = int(os.getenv("SARVAM_BATCH_POLL_INTERVAL_S"
 SARVAM_MAX_CONCURRENT_CHUNKS: int = int(os.getenv("SARVAM_MAX_CONCURRENT_CHUNKS", "10"))
 
 # ── Translation ───────────────────────────────────────────────────────────────
+# Translation is always English-only in this product. The env var is kept only
+# so we can toggle translation off entirely by setting it to "" (empty string).
 DEFAULT_TARGET_LANGUAGES: list[str] = [
     x.strip()
     for x in os.getenv("DEFAULT_TARGET_LANGUAGES", "en").split(",")
@@ -37,11 +38,16 @@ TRANSLATION_FAILURE_THRESHOLD: float = float(
 
 # ── AWS ───────────────────────────────────────────────────────────────────────
 AWS_REGION: str = os.getenv("AWS_REGION", "ap-south-1")
-S3_PROCESSED_BUCKET: str = os.getenv("S3_PROCESSED_BUCKET", "")
 
-# Completion-event queue — the worker publishes one SQS message per job
-# (status=completed or failed) so downstream services (API backend, frontend,
-# notifications) don't have to poll RDS. Leave unset to skip publishing.
+# Bucket where the worker writes the final results JSON. The SQS completion
+# event carries a pointer (bucket + key) into this bucket; the backend reads
+# from here. Typically the same bucket as uploads, using a `results/` prefix.
+S3_PROCESSED_BUCKET: str = os.getenv("S3_PROCESSED_BUCKET", "")
+S3_RESULTS_PREFIX: str = os.getenv("S3_RESULTS_PREFIX", "results/")
+
+# Completion-event queue — the worker publishes exactly one SQS message per
+# job (status=completed or failed) containing an S3 pointer to the results
+# JSON (completed) or the error message (failed). Backend consumes from here.
 JOB_EVENTS_QUEUE_URL: str = os.getenv("JOB_EVENTS_QUEUE_URL", "")
 
 # ── Overlap stitching ─────────────────────────────────────────────────────────
@@ -65,13 +71,7 @@ def _get_secret(secret_name: str) -> str:
         raise
 
 
-def _get_secret_json(secret_name: str) -> dict:
-    """Fetch a JSON secret from AWS Secrets Manager."""
-    return json.loads(_get_secret(secret_name))
-
-
 _sarvam_api_key: str | None = None
-_db_url: str | None = None
 
 
 def get_sarvam_api_key() -> str:
@@ -81,24 +81,3 @@ def get_sarvam_api_key() -> str:
         # Allow direct env var for local development
         _sarvam_api_key = os.getenv("SARVAM_API_KEY") or _get_secret(secret_name).strip()
     return _sarvam_api_key
-
-
-def get_db_url() -> str:
-    global _db_url
-    if _db_url is None:
-        # Allow direct env var for local development
-        direct = os.getenv("DATABASE_URL")
-        if direct:
-            _db_url = direct
-        else:
-            secret_name = os.getenv("RDS_SECRET_NAME", "anchor-voice/rds-credentials")
-            creds = _get_secret_json(secret_name)
-            host = creds["host"]
-            port = creds.get("port", 5432)
-            dbname = creds.get("dbname", "anchorvoice")
-            user = creds["username"]
-            password = creds["password"]
-            _db_url = f"postgresql+psycopg2://{user}:{password}@{host}:{port}/{dbname}"
-    return _db_url
-
-
