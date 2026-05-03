@@ -25,14 +25,26 @@ SARVAM_MAX_CONCURRENT_CHUNKS: int = int(os.getenv("SARVAM_MAX_CONCURRENT_CHUNKS"
 # running in parallel with the transcription pass. There is no per-job target
 # language; the only knob is the failure threshold below.
 #
-# Fraction of non-empty source segments (0.0–1.0) that may come back with empty
-# `translation` after the timestamp-overlap zip before the job is marked failed
-# instead of completed. An empty `translation` means the translate-mode Saaras
-# pass produced no segment whose timestamps overlapped the corresponding
-# transcription segment — a sign of either model drift between modes or a
-# wholly failed translate pass on this audio.
+# Fraction of *substantial* source segments (those with text length ≥
+# TRANSLATION_MIN_SUBSTANTIAL_CHARS) that may come back with empty
+# `translation` after the single-best-match overlap zip before the job is
+# marked failed instead of completed. Brief backchannels ("Hmm", "Skirt",
+# "Okay") are deliberately excluded from this rate because the zip
+# correctly leaves them with empty translation when no translate-pass
+# segment maps to them — they're noise, not failures. A non-trivial
+# segment with empty translation is the real signal of trouble (model
+# drift between codemix and translate modes, or a wholly failed translate
+# pass on this audio).
 TRANSLATION_FAILURE_THRESHOLD: float = float(
-    os.getenv("TRANSLATION_FAILURE_THRESHOLD", "0.05")
+    os.getenv("TRANSLATION_FAILURE_THRESHOLD", "0.10")
+)
+
+# Minimum text length (characters, post-strip) for a transcription segment
+# to count toward the translation-coverage failure rate. Anything shorter
+# is treated as a backchannel/interjection that the translate pass is
+# allowed to omit without penalty.
+TRANSLATION_MIN_SUBSTANTIAL_CHARS: int = int(
+    os.getenv("TRANSLATION_MIN_SUBSTANTIAL_CHARS", "20")
 )
 
 # ── AWS ───────────────────────────────────────────────────────────────────────

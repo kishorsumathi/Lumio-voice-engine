@@ -28,7 +28,10 @@ import structlog
 
 from .audio import convert_to_mono_wav, get_duration
 from .chunking import chunk_audio
-from .config import TRANSLATION_FAILURE_THRESHOLD
+from .config import (
+    TRANSLATION_FAILURE_THRESHOLD,
+    TRANSLATION_MIN_SUBSTANTIAL_CHARS,
+)
 from .events import publish_job_event
 from .merger import merge
 from .metrics import emit_job_outcome, emit_translation_coverage
@@ -192,20 +195,37 @@ def process_job(
             # ── 6. Translation coverage check ─────────────────────────────
             # Translation is produced inline by Sarvam's translate pass and
             # carried on each merged segment. Empty `translation` on a
-            # non-empty `text` means the translate pass produced no segment
-            # whose timestamps overlapped this transcription segment.
-            nonempty_src = sum(1 for s in merged if s.text.strip())
-            empty = sum(
+            # short backchannel ("Hmm", "Okay", "Skirt") is *expected* under
+            # the single-best-match overlap zip — those segments simply have
+            # no translate-pass segment that maps to them. We therefore
+            # measure failure only on **substantial** segments (text length
+            # ≥ TRANSLATION_MIN_SUBSTANTIAL_CHARS). Empty translation on a
+            # substantial segment is the real signal of trouble.
+            substantial = [
+                s for s in merged
+                if len(s.text.strip()) >= TRANSLATION_MIN_SUBSTANTIAL_CHARS
+            ]
+            nonempty_src = len(substantial)
+            empty = sum(1 for s in substantial if not s.translation.strip())
+            fail_rate = (empty / nonempty_src) if nonempty_src else 0.0
+
+            # Also track the broader signal for observability (every segment
+            # with text vs every segment with translation), but don't gate
+            # on it — the gate uses the substantial-only rate above.
+            total_text = sum(1 for s in merged if s.text.strip())
+            total_empty = sum(
                 1 for s in merged
                 if not s.translation.strip() and s.text.strip()
             )
-            fail_rate = (empty / nonempty_src) if nonempty_src else 0.0
             log.info(
                 "Translation coverage",
                 language="en-IN",
                 empty_segments=empty,
                 nonempty_source=nonempty_src,
                 failure_rate=round(fail_rate, 4),
+                total_text_segments=total_text,
+                total_empty_translations=total_empty,
+                min_substantial_chars=TRANSLATION_MIN_SUBSTANTIAL_CHARS,
             )
             emit_translation_coverage(
                 language="en-IN",
@@ -216,7 +236,7 @@ def process_job(
                 raise RuntimeError(
                     f"Translation failure rate {fail_rate:.1%} for en-IN "
                     f"exceeds threshold {TRANSLATION_FAILURE_THRESHOLD:.1%} "
-                    f"({empty}/{nonempty_src} segments empty)"
+                    f"({empty}/{nonempty_src} substantial segments empty)"
                 )
 
             # ── 7. Assemble + persist results JSON to S3 ──────────────────
