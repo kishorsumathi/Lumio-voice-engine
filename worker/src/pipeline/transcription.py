@@ -1,11 +1,24 @@
 """
-Sarvam Saaras v3 batch transcription.
+Sarvam Saaras v3 batch transcription + translation (dual-pass).
 
-Each audio chunk is submitted as an independent Sarvam batch job.
-Multiple chunks are processed in parallel (up to SARVAM_MAX_CONCURRENT_CHUNKS).
+Each audio chunk is submitted twice to Sarvam in parallel:
 
-The start_time_offset for each chunk is added to all returned timestamps
-so every segment carries an absolute position in the full audio.
+  - Job A (`mode=codemix`)   → diarized text in the original language(s).
+                                Owns the canonical timeline and speaker IDs.
+  - Job B (`mode=translate`) → diarized text translated to English by Sarvam.
+                                Provides per-segment English text only.
+
+The two jobs run on the same audio so timestamps are directly comparable.
+After both complete we attach English text to each transcription segment by
+**timestamp-overlap matching** — for every transcribe segment, all translate
+segments whose time window overlaps it are concatenated in chronological
+order and stored on `TranscriptSegment.translation`.
+
+This replaces the previous Mayura-text-translation step (and its language-
+detection fallback). Sarvam's `translate` mode handles code-mixed audio
+(Hinglish) natively, sidestepping the romanized-Hindi failure mode where
+Mayura's auto-detect treated Latin-script Hindi as English and passed it
+through unchanged.
 """
 import logging
 import os
@@ -34,7 +47,8 @@ class TranscriptSegment:
     speaker_id: str        # Sarvam's raw speaker ID (will be remapped later)
     start_time: float      # absolute seconds in full audio
     end_time: float        # absolute seconds in full audio
-    text: str
+    text: str              # original-language transcription (codemix output)
+    translation: str = ""  # English (from the parallel translate-mode pass)
     confidence: float | None = None
 
 
@@ -49,37 +63,41 @@ def _sarvam_client():
     before_sleep=before_sleep_log(logger, logging.WARNING),
     reraise=True,
 )
-def transcribe_chunk(chunk: ChunkInfo) -> list[TranscriptSegment]:
+def _run_saaras_job(chunk: ChunkInfo, *, mode: str) -> list[TranscriptSegment]:
     """
-    Transcribe a single audio chunk via Sarvam batch API.
+    Submit one Sarvam batch job for `chunk` with the given Saaras `mode`.
+
+    Returns a list of `TranscriptSegment` whose `text` field carries whatever
+    Saaras produced for that mode — original language for `codemix`, English
+    for `translate`. The caller decides what to do with the text (use it as
+    transcription, or merge it into another segment list as translation).
 
     Retries up to 3 times with exponential backoff on transient failures.
-    429 rate limit errors wait 60s before retry.
-    chunk.start_time is added to all timestamps for absolute positioning.
+    A 429 rate-limit response sleeps 60 s before re-raising into the retry.
     """
     from sarvamai.core.api_error import ApiError
 
     client = _sarvam_client()
     try:
-        return _transcribe_chunk_inner(client, chunk)
+        return _run_saaras_job_inner(client, chunk, mode=mode)
     except ApiError as e:
         if e.status_code == 429:
-            logger.warning("Sarvam 429 on chunk %d — waiting 60s", chunk.index)
+            logger.warning("Sarvam 429 on chunk %d (mode=%s) — waiting 60s",
+                           chunk.index, mode)
             time.sleep(60)
         raise
 
 
-def _transcribe_chunk_inner(client, chunk: ChunkInfo) -> list[TranscriptSegment]:
-
+def _run_saaras_job_inner(client, chunk: ChunkInfo, *, mode: str) -> list[TranscriptSegment]:
     logger.info(
-        "Transcribing chunk %d (%.1f–%.1fs, %.1fmin)",
-        chunk.index, chunk.start_time, chunk.end_time, chunk.duration / 60.0,
+        "Saaras job (mode=%s) chunk %d (%.1f–%.1fs, %.1fmin)",
+        mode, chunk.index, chunk.start_time, chunk.end_time, chunk.duration / 60.0,
     )
 
     throttle()
     job = client.speech_to_text_job.create_job(
         model="saaras:v3",
-        mode="codemix",             # handles mixed-language audio (Hinglish, etc.)
+        mode=mode,                  # "codemix" → original; "translate" → English
         language_code="unknown",    # auto-detect all 22 Indian languages + English
         with_diarization=True,
     )
@@ -96,7 +114,9 @@ def _transcribe_chunk_inner(client, chunk: ChunkInfo) -> list[TranscriptSegment]
     file_results = job.get_file_results()
     if file_results["failed"]:
         err = file_results["failed"][0].get("error_message", "unknown error")
-        raise RuntimeError(f"Sarvam batch job failed for chunk {chunk.index}: {err}")
+        raise RuntimeError(
+            f"Sarvam batch job failed for chunk {chunk.index} (mode={mode}): {err}"
+        )
 
     with tempfile.TemporaryDirectory() as out_dir:
         job.download_outputs(out_dir)
@@ -107,11 +127,12 @@ def _transcribe_chunk_inner(client, chunk: ChunkInfo) -> list[TranscriptSegment]
                     data = json.load(f)
                 segments = _parse_batch_output(data, chunk)
                 logger.info(
-                    "Chunk %d: %d segments transcribed", chunk.index, len(segments)
+                    "Chunk %d (mode=%s): %d segments",
+                    chunk.index, mode, len(segments),
                 )
                 return segments
 
-    logger.warning("Chunk %d: no JSON output found", chunk.index)
+    logger.warning("Chunk %d (mode=%s): no JSON output found", chunk.index, mode)
     return []
 
 
@@ -179,16 +200,80 @@ def _parse_batch_output(data: dict, chunk: ChunkInfo) -> list[TranscriptSegment]
     return segments
 
 
+def _zip_translation_into_segments(
+    tx_segments: list[TranscriptSegment],
+    tr_segments: list[TranscriptSegment],
+) -> list[TranscriptSegment]:
+    """
+    Attach English text from `tr_segments` to `tx_segments` by timestamp overlap.
+
+    For each transcription segment, all translation segments whose time window
+    has any overlap with it are picked up and concatenated in chronological
+    order. Non-overlapping translation segments are silently dropped (they
+    would only happen if Sarvam diarized very differently between the two
+    runs — rare on the same audio).
+
+    Mutates the `translation` field of each `tx_segments` entry and returns
+    the same list.
+    """
+    if not tx_segments:
+        return tx_segments
+
+    for tx in tx_segments:
+        overlapping: list[tuple[float, str]] = []
+        for tr in tr_segments:
+            overlap_start = max(tx.start_time, tr.start_time)
+            overlap_end = min(tx.end_time, tr.end_time)
+            if overlap_end > overlap_start:
+                overlapping.append((tr.start_time, tr.text))
+        overlapping.sort(key=lambda x: x[0])
+        tx.translation = " ".join(t for _, t in overlapping).strip()
+
+    return tx_segments
+
+
+def _process_chunk(chunk: ChunkInfo) -> list[TranscriptSegment]:
+    """
+    Run transcribe (`codemix`) and translate Saaras jobs for one chunk in
+    parallel, then merge the translation text into the transcription segments
+    by timestamp overlap.
+    """
+    with ThreadPoolExecutor(max_workers=2) as ex:
+        f_tx = ex.submit(_run_saaras_job, chunk, mode="codemix")
+        f_tr = ex.submit(_run_saaras_job, chunk, mode="translate")
+        tx_segments = f_tx.result()
+        tr_segments = f_tr.result()
+
+    if not tr_segments:
+        # Translate pass returned nothing — keep transcription, leave
+        # translation empty per segment. This is logged at WARNING by the
+        # parser already.
+        logger.warning(
+            "Chunk %d: translate pass returned 0 segments — translation will be empty",
+            chunk.index,
+        )
+        return tx_segments
+
+    return _zip_translation_into_segments(tx_segments, tr_segments)
+
+
 def transcribe_all_chunks(chunks: list[ChunkInfo]) -> list[TranscriptSegment]:
     """
-    Transcribe all chunks in parallel (up to SARVAM_MAX_CONCURRENT_CHUNKS).
-    Returns segments sorted by absolute start_time.
+    Transcribe + translate all chunks in parallel.
+
+    Up to `SARVAM_MAX_CONCURRENT_CHUNKS` chunks are processed concurrently.
+    Each chunk internally fans out to two Sarvam batch jobs (codemix +
+    translate). The global RPM throttle in `rate_limit.throttle()` keeps the
+    Sarvam API call rate under `SARVAM_RPM_LIMIT` regardless of pool size.
+
+    Returns segments sorted by absolute start_time, with `translation`
+    populated from the translate pass.
     """
     all_segments: list[TranscriptSegment] = []
 
     with ThreadPoolExecutor(max_workers=SARVAM_MAX_CONCURRENT_CHUNKS) as executor:
         future_to_chunk = {
-            executor.submit(transcribe_chunk, chunk): chunk
+            executor.submit(_process_chunk, chunk): chunk
             for chunk in chunks
         }
         for future in as_completed(future_to_chunk):
@@ -197,7 +282,8 @@ def transcribe_all_chunks(chunks: list[ChunkInfo]) -> list[TranscriptSegment]:
                 segs = future.result()
                 all_segments.extend(segs)
             except Exception as e:
-                logger.error("Chunk %d transcription failed: %s", chunk.index, e)
+                logger.error("Chunk %d transcribe+translate failed: %s",
+                             chunk.index, e)
                 raise RuntimeError(f"Chunk {chunk.index} failed: {e}") from e
 
     all_segments.sort(key=lambda s: s.start_time)

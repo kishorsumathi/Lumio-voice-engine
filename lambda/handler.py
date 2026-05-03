@@ -34,7 +34,6 @@ ECS_SUBNETS = os.environ["ECS_SUBNETS"].split(",")
 ECS_SECURITY_GROUPS = os.environ["ECS_SECURITY_GROUPS"].split(",")
 ECS_ASSIGN_PUBLIC_IP = os.environ.get("ECS_ASSIGN_PUBLIC_IP", "ENABLED")
 SQS_QUEUE_URL = os.environ["SQS_QUEUE_URL"]
-TARGET_LANGUAGES = os.environ.get("TARGET_LANGUAGES", "en")
 
 ecs = boto3.client("ecs")
 
@@ -59,7 +58,6 @@ def _dispatch_one(bucket: str, key: str, receipt_handle: str) -> None:
                     "environment": [
                         {"name": "S3_BUCKET",          "value": bucket},
                         {"name": "S3_KEY",             "value": key},
-                        {"name": "TARGET_LANGUAGES",   "value": TARGET_LANGUAGES},
                         {"name": "SQS_QUEUE_URL",      "value": SQS_QUEUE_URL},
                         {"name": "SQS_RECEIPT_HANDLE", "value": receipt_handle},
                     ],

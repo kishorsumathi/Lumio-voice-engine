@@ -9,17 +9,19 @@ Event-driven AWS pipeline for transcribing and translating long-form audio — m
 ```
 S3 upload → EventBridge → SQS FIFO → Lambda → ECS Fargate
                                                     │
-                                        ┌───────────┴─────────────────┐
-                                        │  Pipeline                   │
-                                        │  1. VAD chunking            │
-                                        │  2. Transcription ──────────┼──► Sarvam Saaras v3
-                                        │  3. Speaker stitching       │
-                                        │  4. Batched translation ────┼──► Sarvam Mayura v1
-                                        │     + Indic-passthrough     │
-                                        │       retry (en-IN)         │
-                                        │  5. Write results JSON ─────┼──► S3 (results/ prefix)
-                                        │  6. Publish pointer event ──┼──► SQS job-events queue
-                                        └─────────────────────────────┘
+                                        ┌───────────┴───────────────────────┐
+                                        │  Pipeline                         │
+                                        │  1. VAD chunking                  │
+                                        │  2. Per-chunk parallel:           │
+                                        │       Saaras mode=codemix    ─────┼──► Sarvam Saaras v3
+                                        │       Saaras mode=translate  ─────┼──► Sarvam Saaras v3
+                                        │       (timestamp-overlap zip      │
+                                        │        attaches English to        │
+                                        │        each transcription seg)    │
+                                        │  3. Cross-chunk speaker stitching │
+                                        │  4. Write results JSON ───────────┼──► S3 (results/ prefix)
+                                        │  5. Publish pointer event ────────┼──► SQS job-events queue
+                                        └───────────────────────────────────┘
 ```
 
 The worker has **no database**. Each finished job is persisted as a single
@@ -97,10 +99,8 @@ Uploads land at `uploads/{uuid}/{filename}` which EventBridge already routes to 
 │       ├── config.py           # All env vars + Secrets Manager
 │       ├── audio.py            # Duration, video→audio extract; 16 kHz mono WAV for Sarvam
 │       ├── chunking.py         # VAD-based smart splitting with overlap
-│       ├── transcription.py    # Sarvam batch API, parallel chunks
+│       ├── transcription.py    # Dual Saaras pass per chunk (codemix + translate) + overlap zip
 │       ├── merger.py           # Cross-chunk speaker stitching
-│       ├── translation.py      # Batched parallel translation + en-IN Indic-passthrough retry
-│       ├── lang_detect.py      # Lingua-based source LID (Hindi vs Marathi) — retry-path fallback only
 │       ├── results_writer.py   # Serialize + PUT results JSON to S3 (claim-check)
 │       ├── events.py           # Publish job.completed (pointer) / job.failed (error) to SQS
 │       ├── rate_limit.py       # Shared 100 RPM sliding-window limiter
@@ -153,9 +153,8 @@ Full schema and consumer sketch: [docs/architecture.md](docs/architecture.md#sta
 - **No database** — results are stored in S3 (one JSON per job, claim-check); the SQS event carries only a pointer. Backend consumers do one S3 GET per completion event. Missed events are recoverable by listing the `results/` prefix.
 - **No pyannote / no diarization model** — Sarvam provides per-chunk diarization; overlap text matching stitches speaker IDs across chunks
 - **No NAT gateway** — ECS runs in public subnets with `assignPublicIp=ENABLED`; saves ~$32/month. No RDS, no private subnets.
-- **Sarvam-only** — transcription, diarization, and translation all via Sarvam APIs
-- **100 RPM shared** — single sliding-window rate limiter across all Sarvam calls
-- **Sarvam STT audio** — Every batch upload is **16 kHz, mono, 16-bit WAV (`pcm_s16le`)** per [Sarvam’s STT FAQ](https://docs.sarvam.ai/api-reference-docs/speech-to-text/faq). Sessions **≤ 60 min** use one `chunk_000.wav` (no VAD split / stitch — typical medical session). Longer audio: one full-file normalize, **VAD on that master**, then overlapping **`chunk_NNN.wav`** slices via ffmpeg **stream copy** (no per-chunk resample).
-- **Translation batching** — up to 10 segments / 900 chars per Mayura call (delimiter `⟦S⟧`); ~10× fewer API calls than per-segment translation
-- **Indic-passthrough repair with Lingua LID** — for `en-IN` targets, segments where Mayura auto-detect returns the Hinglish input unchanged are re-translated with an explicit source code. Byte-level script regex is the entry gate (*should we retry?*); [Lingua](https://github.com/pemistahl/lingua-py) — restricted to the 9 Indian languages it ships models for + English, 0.75 confidence floor — picks the actual Mayura source code from the original text, which disambiguates **Hindi vs Marathi** (both Devanagari) that pure Unicode ranges can't. Kannada, Malayalam, Odia and every other script with a unique Unicode block go through the regex fallback (100% accurate, no lingua needed). See [docs/architecture.md](docs/architecture.md#en-in-indic-passthrough-retry-pass).
+- **Sarvam-only, single product, two modes** — transcription uses Saaras v3 `mode=codemix`, translation uses Saaras v3 `mode=translate`. No Mayura, no language-detection sidecar (`lingua` removed). Both Saaras passes run in parallel per chunk; their outputs are merged by timestamp overlap (the codemix pass owns the canonical timeline + speaker IDs).
+- **Why two Saaras passes instead of Mayura on the transcript** — Saaras `mode=translate` handles dense Hinglish / code-switched audio natively, sidestepping the failure mode where Mayura's `auto`-source detector treated romanized Hindi as English and passed it through unchanged. The whole `translation.py` + `lang_detect.py` retry/repair stack (≈ 700 lines) is gone.
+- **100 RPM shared** — single sliding-window rate limiter across all Sarvam calls. The throttle is per-API-call, so the doubled per-chunk concurrency (codemix + translate) doesn't change the absolute Sarvam request rate.
+- **Sarvam STT audio** — Every batch upload is **16 kHz, mono, 16-bit WAV (`pcm_s16le`)** per [Sarvam's STT FAQ](https://docs.sarvam.ai/api-reference-docs/speech-to-text/faq). Sessions **≤ 60 min** use one `chunk_000.wav` (no VAD split / stitch — typical medical session). Longer audio: one full-file normalize, **VAD on that master**, then overlapping **`chunk_NNN.wav`** slices via ffmpeg **stream copy** (no per-chunk resample).
 - **Claim-check completion events** — on success the SQS event is a pointer to `s3://<processed-bucket>/results/<job_id>.json`; on failure it carries `error_message` inline (no results file is written). Schema and consumer sketch in [docs/architecture.md](docs/architecture.md#stage-7--completion-event-claim-check-pointer).

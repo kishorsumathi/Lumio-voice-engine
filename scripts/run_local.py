@@ -45,7 +45,6 @@ from pipeline.merger import merge  # noqa: E402
 from pipeline.results_writer import build_results_document  # noqa: E402
 from pipeline.s3 import _MP4_REMAP  # noqa: E402
 from pipeline.transcription import transcribe_all_chunks  # noqa: E402
-from pipeline.translation import translate_segments  # noqa: E402
 
 
 def _segment_timestamp(seg) -> str:
@@ -55,7 +54,7 @@ def _segment_timestamp(seg) -> str:
     )
 
 
-def write_transcript_txt(audio_path: Path, merged, english_by_index: dict, output_path: Path) -> None:
+def write_transcript_txt(audio_path: Path, merged, output_path: Path) -> None:
     lines = [
         f"Anchor-Voice Transcript — {audio_path.name}",
         "=" * 70,
@@ -65,9 +64,8 @@ def write_transcript_txt(audio_path: Path, merged, english_by_index: dict, outpu
         ts = _segment_timestamp(seg)
         lines.append(f"Speaker {seg.speaker_id}  {ts}")
         lines.append(f"  {seg.text}")
-        translated = english_by_index.get(seg.segment_index, "")
-        if translated:
-            lines.append(f"  [en] {translated}")
+        if seg.translation:
+            lines.append(f"  [en] {seg.translation}")
         lines.append("")
     output_path.write_text("\n".join(lines), encoding="utf-8")
     print(f"\nTranscript saved → {output_path}")
@@ -113,23 +111,21 @@ def run(audio_path: Path) -> None:
                 print(f"  [{c.index}] {c.start_time:.1f}s–{c.end_time:.1f}s "
                       f"({c.duration/60:.1f}min) [{c.split_reason}]")
 
-            print("\nTranscribing chunks...")
+            print("\nTranscribing + translating chunks (parallel Saaras passes)...")
             transcript_segs = transcribe_all_chunks(chunks)
             print(f"Transcript segments: {len(transcript_segs)}")
 
             merged = merge(chunks, transcript_segs)
             print(f"\nMerged segments: {len(merged)}")
+            non_empty_translation = sum(1 for s in merged if s.translation)
+            print(f"Translation coverage: {non_empty_translation}/{len(merged)} segments")
             print("\n--- Transcript Preview ---")
             for seg in merged[:10]:
                 print(f"  [Speaker {seg.speaker_id}] {seg.start_time:.1f}s: {seg.text[:80]}")
+                if seg.translation:
+                    print(f"      [en] {seg.translation[:80]}")
             if len(merged) > 10:
                 print(f"  ... ({len(merged) - 10} more segments)")
-
-            print(f"\nTranslating {len(merged)} segments → en...")
-            translations = translate_segments(merged, ["en"])
-            english = translations.get("en", [])
-            non_empty = sum(1 for t in english if t.translated_text)
-            print(f"  en: {non_empty}/{len(english)} segments translated")
 
             num_speakers = len(set(s.speaker_id for s in merged))
             completed_at = datetime.now(timezone.utc)
@@ -144,7 +140,6 @@ def run(audio_path: Path) -> None:
                 num_speakers=num_speakers,
                 source_language=None,
                 merged=merged,
-                english_translation=english,
                 started_at=started_at,
                 completed_at=completed_at,
             )
@@ -157,8 +152,7 @@ def run(audio_path: Path) -> None:
             print(f"\nResults JSON saved → {json_path}")
 
             txt_path = audio_path.parent / f"{audio_path.stem}_transcript.txt"
-            english_by_index = {t.segment_index: t.translated_text for t in english}
-            write_transcript_txt(audio_path, merged, english_by_index, txt_path)
+            write_transcript_txt(audio_path, merged, txt_path)
 
             print(f"\n✓ Pipeline complete. Job ID: {job_id}")
             print(f"  Speakers: {num_speakers}  Segments: {len(merged)}")

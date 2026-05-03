@@ -4,7 +4,8 @@ version = "0.1.0"
 description = "Production audio transcription pipeline worker (Sarvam + overlap stitching)"
 requires-python = ">=3.12"
 dependencies = [
-    # Sarvam STT + Translation
+    # Sarvam Saaras v3 — both transcription (mode=codemix) and translation
+    # (mode=translate) run as parallel batch jobs per chunk
     "sarvamai>=0.1.27",
     # torch — CPU-only, required by silero-vad
     "torch>=2.2.0",
@@ -24,8 +25,6 @@ dependencies = [
     "structlog>=24.1",
     # Environment
     "python-dotenv>=1.0",
-    # Language detection (fallback on en-IN passthrough retry — Hindi vs Marathi, etc.)
-    "lingua-language-detector>=2.0",
 ]
 
 [project.scripts]

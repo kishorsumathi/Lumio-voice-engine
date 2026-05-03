@@ -30,7 +30,6 @@ from botocore.exceptions import ClientError
 
 from .config import AWS_REGION, S3_PROCESSED_BUCKET, S3_RESULTS_PREFIX
 from .merger import MergedSegment
-from .translation import TranslatedSegment
 
 logger = logging.getLogger(__name__)
 
@@ -74,7 +73,6 @@ def build_results_document(
     num_speakers: int,
     source_language: str | None,
     merged: list[MergedSegment],
-    english_translation: list[TranslatedSegment],
     started_at: datetime,
     completed_at: datetime,
 ) -> dict:
@@ -89,13 +87,11 @@ def build_results_document(
       segments[]: { segment_index, chunk_index, speaker_id, start_time, end_time,
                     transcription, translation, confidence }
 
-    Translation is always English; it is inlined per segment under the key
-    `translation`. Segments with a failed translation have `translation: ""`.
+    Translation is always English. It is produced by a parallel Saaras
+    `mode=translate` pass during transcription and carried on the segment
+    itself (`MergedSegment.translation`). Segments where the translate pass
+    produced no overlapping output have `translation: ""`.
     """
-    translation_by_index: dict[int, str] = {
-        t.segment_index: t.translated_text for t in english_translation
-    }
-
     segments = [
         {
             "segment_index": s.segment_index,
@@ -104,7 +100,7 @@ def build_results_document(
             "start_time": round(s.start_time, 3),
             "end_time": round(s.end_time, 3),
             "transcription": s.text,
-            "translation": translation_by_index.get(s.segment_index, ""),
+            "translation": s.translation,
             "confidence": (
                 round(s.confidence, 3) if s.confidence is not None else None
             ),

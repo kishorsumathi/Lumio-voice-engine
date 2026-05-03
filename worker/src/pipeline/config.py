@@ -21,17 +21,16 @@ SARVAM_BATCH_POLL_INTERVAL_S: int = int(os.getenv("SARVAM_BATCH_POLL_INTERVAL_S"
 SARVAM_MAX_CONCURRENT_CHUNKS: int = int(os.getenv("SARVAM_MAX_CONCURRENT_CHUNKS", "10"))
 
 # ── Translation ───────────────────────────────────────────────────────────────
-# Translation is always English-only in this product. The env var is kept only
-# so we can toggle translation off entirely by setting it to "" (empty string).
-DEFAULT_TARGET_LANGUAGES: list[str] = [
-    x.strip()
-    for x in os.getenv("DEFAULT_TARGET_LANGUAGES", "en").split(",")
-    if x.strip()
-]
-# Fraction of segments (0.0–1.0) that may come back with empty translated_text
-# per language before the job is marked failed instead of completed. Covers the
-# case where a whole batch throws — translation.py stores "" for those segments
-# so they must be surfaced at the job level, not silently dropped.
+# Translation is always English-only and produced by Sarvam Saaras `mode=translate`
+# running in parallel with the transcription pass. There is no per-job target
+# language; the only knob is the failure threshold below.
+#
+# Fraction of non-empty source segments (0.0–1.0) that may come back with empty
+# `translation` after the timestamp-overlap zip before the job is marked failed
+# instead of completed. An empty `translation` means the translate-mode Saaras
+# pass produced no segment whose timestamps overlapped the corresponding
+# transcription segment — a sign of either model drift between modes or a
+# wholly failed translate pass on this audio.
 TRANSLATION_FAILURE_THRESHOLD: float = float(
     os.getenv("TRANSLATION_FAILURE_THRESHOLD", "0.05")
 )

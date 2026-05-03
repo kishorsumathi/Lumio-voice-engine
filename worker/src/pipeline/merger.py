@@ -26,7 +26,8 @@ class MergedSegment:
     speaker_id: int        # 0-based global integer
     start_time: float
     end_time: float
-    text: str
+    text: str              # original-language transcription
+    translation: str       # English (carried through from the translate pass)
     confidence: float | None
 
 
@@ -102,9 +103,16 @@ def _normalize_to_int(segments: list[MergedSegment]) -> list[MergedSegment]:
             start_time=seg.start_time,
             end_time=seg.end_time,
             text=seg.text,
+            translation=seg.translation,
             confidence=seg.confidence,
         ))
     return result
+
+
+def _join_translations(prev: str, curr: str) -> str:
+    """Concatenate two translations, dropping empties so we don't get leading/trailing spaces."""
+    parts = [p for p in (prev.strip(), curr.strip()) if p]
+    return " ".join(parts)
 
 
 def _merge_consecutive(segments: list[MergedSegment]) -> list[MergedSegment]:
@@ -122,6 +130,7 @@ def _merge_consecutive(segments: list[MergedSegment]) -> list[MergedSegment]:
                 start_time=prev.start_time,
                 end_time=seg.end_time,
                 text=prev.text + " " + seg.text,
+                translation=_join_translations(prev.translation, seg.translation),
                 confidence=prev.confidence,
             )
         else:
@@ -189,6 +198,7 @@ def merge(
                 start_time=seg.start_time,
                 end_time=seg.end_time,
                 text=seg.text,
+                translation=seg.translation,
                 confidence=seg.confidence,
             ))
 

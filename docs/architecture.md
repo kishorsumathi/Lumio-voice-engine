@@ -35,16 +35,19 @@ Target users: doctors, therapists, psychiatrists recording clinical sessions.
 │      │ ECS RunTask (injects env vars)                           │
 │      ▼                                                          │
 │  ECS Fargate Task (4 vCPU, 16GB RAM)                            │
-│  ┌───────────────────────────────────┐                          │
-│  │  Pipeline (main.py)               │                          │
-│  │    1. Download from S3            │                          │
-│  │    2. VAD chunking (silero-vad)   │                          │
-│  │    3. Parallel transcription      │──► Sarvam Saaras v3      │
-│  │    4. Overlap speaker stitching   │                          │
-│  │    5. Translation                 │──► Sarvam Mayura v1      │
-│  │    6. Write results JSON          │──► S3 (results/ prefix)  │
-│  │    7. Publish pointer event       │──► SQS job-events queue  │
-│  └───────────────────────────────────┘                          │
+│  ┌────────────────────────────────────────────┐                 │
+│  │  Pipeline (main.py)                        │                 │
+│  │    1. Download from S3                     │                 │
+│  │    2. VAD chunking (silero-vad)            │                 │
+│  │    3. Parallel per chunk:                  │                 │
+│  │         3a. Saaras mode=codemix   ─────────┼─► Sarvam Saaras │
+│  │         3b. Saaras mode=translate ─────────┼─► Sarvam Saaras │
+│  │         (timestamp-overlap zip merges      │                 │
+│  │          translation onto transcription)   │                 │
+│  │    4. Overlap speaker stitching            │                 │
+│  │    5. Write results JSON ──────────────────┼─► S3 (results/) │
+│  │    6. Publish pointer event ───────────────┼─► SQS events    │
+│  └────────────────────────────────────────────┘                 │
 │                                                                 │
 │  SQS job-events queue  ──► Backend consumer (reads results JSON │
 │                             from S3 via pointer in the event)   │
@@ -119,27 +122,52 @@ For long audio, **silero-vad** runs on **`{stem}_16k_mono.wav`**; Sarvam **`chun
 
 ---
 
-### Stage 3 — Parallel Transcription
+### Stage 3 — Parallel transcription + translation (dual Saaras pass)
 
 **File:** `transcription.py`
 
-All chunks are submitted to Sarvam's batch API in parallel (up to `SARVAM_MAX_CONCURRENT_CHUNKS`, default 10).
+For every chunk we submit **two** Sarvam Saaras v3 batch jobs in parallel — one for the original-language transcription and one for the English translation — and merge their outputs by timestamp overlap. Sarvam supports diarization in both `mode=codemix` and `mode=translate`, so the two passes carry the same audio's speaker structure and we don't need a separate text-translation step (Mayura) anywhere in the pipeline.
+
+```
+chunk.wav
+    │
+    ├── Saaras job (mode=codemix,    with_diarization=true) ─► transcription segments  (original language)
+    │
+    └── Saaras job (mode=translate,  with_diarization=true) ─► translation segments    (English)
+                                                                  │
+                                              timestamp-overlap zip
+                                                                  ▼
+                                       TranscriptSegment(text, translation, …)
+```
+
+Why two passes instead of Mayura on the transcription text:
+
+- Saaras `mode=translate` handles dense **Hinglish / code-switched** speech natively — it produces clean English even when the audio code-switches mid-sentence. Mayura's `auto`-source path treated romanized Hindi as English and passed it through unchanged, which is the failure this redesign fixes.
+- One Sarvam product, two modes — there is no second SDK, no language-detection heuristic, and no retry-on-passthrough logic to maintain. The whole `translation.py` and `lang_detect.py` modules (≈ 700 lines) are deleted.
+
+Each Saaras job is wrapped by `_run_saaras_job(chunk, mode=...)`:
 
 ```python
 job = client.speech_to_text_job.create_job(
     model="saaras:v3",
-    mode="codemix",           # handles Hinglish, mixed Indian languages
+    mode=mode,                # "codemix" or "translate"
     language_code="unknown",  # auto-detects all 22 Indian languages + English
-    with_diarization=True,    # per-chunk speaker diarization from Sarvam
+    with_diarization=True,
 )
 ```
 
-Each chunk returns `TranscriptSegment` objects with:
-- `speaker_id` — Sarvam's per-chunk label (e.g. "0", "1") — not globally consistent yet
-- `start_time`, `end_time` — absolute seconds in full audio (chunk offset added)
-- `text` — transcribed text
+Concurrency: `transcribe_all_chunks` uses a `ThreadPoolExecutor(max_workers=SARVAM_MAX_CONCURRENT_CHUNKS)` over chunks; each chunk worker spawns a small inner pool of size 2 to run the codemix and translate jobs side-by-side. The global RPM throttle in `rate_limit.throttle()` is applied per-API-call regardless of pool nesting, so `SARVAM_RPM_LIMIT` continues to bound the absolute Sarvam request rate.
 
-**Retry:** 3 attempts, exponential backoff (10s → 60s). 429 rate limit errors wait 60s before retry.
+Each chunk returns a list of `TranscriptSegment` whose fields after the overlap zip are:
+
+- `speaker_id` — Sarvam's per-chunk label from the **codemix** job (e.g. `"0"`, `"1"`); the translate job's speaker IDs are deliberately discarded so the cross-chunk stitcher in Stage 4 sees a single canonical speaker timeline.
+- `start_time`, `end_time` — absolute seconds in full audio (chunk offset added). Owned by the codemix pass.
+- `text` — original-language transcription (codemix output: native script for monolingual speech, romanized Hinglish for code-mixed speech — Sarvam's choice).
+- `translation` — English. Computed by `_zip_translation_into_segments` as the chronologically-sorted concatenation of every translate-pass segment whose time window overlaps the codemix segment by >0 seconds. Empty string if no overlap.
+
+Both Saaras jobs run on the same audio, so diarization boundaries usually agree to within ~100 ms (diarization is computed on voice embeddings, not on the generated text). The dominant residual artefact is **within-turn sentence chopping disagreement**: a single translate segment can span two adjacent codemix segments from the same speaker, in which case the overlap zip attaches the same English text to both rows. Acceptable for human review; refinements (proportional trimming by overlap duration) are documented in Stage 5 below if needed.
+
+**Retry:** each Saaras job retries up to 3 times with exponential backoff (10 s → 60 s). HTTP 429 sleeps 60 s before re-raising into the retry. A failed translate pass on a chunk does **not** fail the chunk — the codemix output is preserved with empty `translation` per segment, and the pipeline continues to the merger.
 
 ---
 
@@ -178,66 +206,31 @@ After stitching:
 
 ---
 
-### Stage 5 — Translation
+### Stage 5 — Translation coverage check
 
-**File:** `translation.py`
+**File:** `main.py` (no separate translation module — see Stage 3).
 
-**Model:** `mayura:v1` — auto source language detection, 11 Indian languages + English, formal mode.
+After `merge()` produces the canonical speaker-stitched segment list, the pipeline computes a coverage metric over the in-segment `translation` field and fails the job if the empty rate exceeds a threshold:
 
-#### Batching strategy (chunking at the text layer)
-
-Merged speaker segments are **not** sent as one Sarvam request per segment. They are **packed into batches**; each batch is one `text.translate` call, then the response is **split** back into per-segment strings.
-
-**Batch limits** (whichever is hit first when appending the next segment):
-
-| Limit | Value | Rationale |
-|-------|--------|-----------|
-| Joined character length | **900** chars | Stays under Mayura’s ~1000 character request cap |
-| Segments per batch | **10** | Hard cap so a single batch stays predictable |
-
-**Packing:** `_build_batches` walks segments in order and greedily fills a batch until the next segment would exceed the char budget **or** the segment count would exceed 10, then starts a new batch.
-
-**Delimiter:** segments are joined with ` ⟦S⟧ ` (Unicode bracket marker with spaces). The response is split on the **exact same** substring. This token is chosen so the model usually **preserves** it; delimiters like `||` are more often normalized or “translated” (e.g. to a word meaning “or”), which would make `split()` return the wrong number of parts.
-
-**Flow:**
-
-```
-seg_a ⟦S⟧ seg_b ⟦S⟧ seg_c  →  [translate once]  →  part_a ⟦S⟧ part_b ⟦S⟧ part_c
-                                                      split(⟦S⟧) → 3 translations
+```python
+nonempty_src = sum(1 for s in merged if s.text.strip())
+empty        = sum(1 for s in merged if not s.translation.strip() and s.text.strip())
+fail_rate    = empty / nonempty_src if nonempty_src else 0.0
 ```
 
-For long jobs (e.g. **~1200+ segments**), batching reduces translate RPCs by roughly an order of magnitude compared to per-segment calls (on the order of **tens of batches** per language instead of thousands — exact count depends on segment lengths).
+A non-empty `text` with empty `translation` means the translate-mode Saaras pass returned no segment whose timestamps overlapped this transcription segment. Two realistic causes:
 
-**Per language:** target languages are normalized (e.g. `en` → `en-IN`). Each language runs **after** the previous: for each language, all batches for that language are scheduled.
+1. The translate pass diverged enough from codemix on diarization boundaries that one transcription segment fell into a sub-second gap between translation segments. Fixable with proportional trimming if it ever becomes common.
+2. The translate pass returned an empty result for the entire chunk (Sarvam-side issue). The chunk-worker logs `translate pass returned 0 segments` at WARNING and the entire chunk's translations come back empty.
 
-**Parallelism within a language:** batches are executed with a `ThreadPoolExecutor` of **10** workers (`MAX_TRANSLATION_WORKERS`). **Every** translate call (batch or fallback) invokes `rate_limit.throttle()` before the HTTP request so all workers share the global RPM cap (see [Rate limiting](#rate-limiting)).
+If `fail_rate > TRANSLATION_FAILURE_THRESHOLD` (default **0.05**, env-overridable) the job is marked failed and the SQS message is left visible for redelivery / DLQ.
 
-#### `en-IN` Indic-passthrough retry pass
+#### Refinements (only enable if real-world coverage drops)
 
-Mayura v1 with `source_language_code="auto"` occasionally **returns the input unchanged** on heavily code-mixed (Hinglish / code-switched) segments when the target is `en-IN` — the output still contains Devanagari / Bengali / Tamil / etc. characters. After the main batch pass completes for `en-IN`, a second surgical pass runs:
+These were considered for Phase 1 and intentionally deferred — the simple overlap zip handles the common case cleanly:
 
-1. **Detect (entry gate — byte-level script check)** — for every translated segment, check if the output still contains any Indic script (Devanagari `\u0900–\u097F`, Bengali `\u0980–\u09FF`, Gurmukhi `\u0A00–\u0A7F`, Gujarati `\u0A80–\u0AFF`, Oriya `\u0B00–\u0B7F`, Tamil `\u0B80–\u0BFF`, Telugu `\u0C00–\u0C7F`, Kannada `\u0C80–\u0CFF`, Malayalam `\u0D00–\u0D7F`). The output is also flagged when it's a byte-for-byte echo of an Indic-script source. This script check is cheap and deterministic — it never decides the wrong thing about *whether* to retry, only triggers the next step.
-2. **Pick source code (two-tier: Lingua for shared scripts, Unicode ranges for unique ones)** — once a segment is flagged, the *source text* (not the failed output) is passed to `lang_detect.detect_source_code` which asks [`lingua-language-detector`](https://github.com/pemistahl/lingua-py) restricted to the **9** Indian languages lingua actually ships models for: Hindi, Marathi, Bengali, Gujarati, Punjabi, Tamil, Telugu, Urdu, and English. Lingua earns its keep on the only script with real ambiguity — **Devanagari (Hindi vs Marathi)**; the old code always mapped all Devanagari to `hi-IN`, bleeding Marathi quality. For **Kannada** (`\u0C80-\u0CFF`), **Malayalam** (`\u0D00-\u0D7F`), **Odia** (`\u0B00-\u0B7F`), and every other Indic script whose Unicode block is unique, the script-range regex (`_detect_indic_source`) is already 100% accurate and runs as a zero-cost fallback whenever lingua returns `None`. The fallback also fires when: lingua's top-1 confidence is below **0.75**, the text is under 10 chars, lingua isn't installed, or lingua wrongly returns `ENGLISH` on a script-confirmed Indic segment.
-3. **Retry** — re-translate **only** flagged segments, one-by-one, with the **explicit** detected source code (no `auto`), `model="mayura:v1"`, `mode="formal"`. Runs through the same 10-worker pool and global RPM throttle.
-4. **Long-segment safety** — if a flagged segment is **>950 chars**, it's pre-split via `_split_long_text` (sentence/word boundaries) into sub-1000-char pieces and each piece retried with the same source code, then rejoined. Prevents Mayura’s 1000-char 400 error on the retry path.
-5. **Accept-only-if-better** — keep the retry only when the output is **non-empty**, contains **no Indic script**, and is **not byte-identical** to the source. Otherwise the original (passthrough) translation is kept — never overwrite with worse output.
-
-> **Why not use Lingua on the main path?** Saaras v3 (`mode=codemix`, `language_code=unknown`) always emits native script, so the byte-level script regex is a perfect "is this non-English?" gate on the way into Mayura. Running a statistical LID on every segment would cost CPU without changing a single decision there. Lingua only earns its keep on the retry path, where the question changes from *whether* the segment is Indic to *which Indic language* (Hindi vs Marathi being the expensive confusion).
-
-Log lines per run: `"en-IN passthrough retry: N/M segments (by source: {...})"` and `"en-IN passthrough retry: K segments repaired"`.
-
-Observed impact on the Hinglish reference audio (1265 segments): remaining Indic-script lines dropped from **~148 (11.7%)** → **~25 (2.0%)** after the retry; the residual is segments where Mayura still can’t produce clean English (model limitation, not pipeline bug).
-
-#### Fallbacks and edge cases
-
-| Situation | Behavior |
-|-----------|----------|
-| `split` yields **≠** number of segments (delimiter lost or altered) | Warning log; **re-translate each segment in that batch** with individual API calls — no guessing |
-| Request rejected for length (400, “exceed” / over limit) | `_split_long_text` splits at sentence boundaries (English `.?!`, Hindi `।`), translates sub-chunks, joins |
-| HTTP **429** | Sleep 60s, retry (tenacity on `_translate_batch_text`) |
-| “Unable to detect” source language | Retry same text with explicit `hi-IN` source |
-| `en-IN` output still contains Indic script (Mayura auto-detect passthrough) | Second pass: Lingua picks the Mayura source code from the original text (falls back to script-range regex on low confidence / missing dep); re-translate each flagged segment with that explicit source; pre-split >950 chars first; keep retry only if cleaner |
-| Batch-level exception after retries | Empty `translated_text` for every segment in that batch; pipeline continues |
+- **Proportional trimming** — when one translate segment overlaps multiple transcription segments, split its text by word-count proportional to overlap duration, instead of attaching the full string to every overlapped row. Cuts duplicate-translation noise on within-turn chopping disagreements.
+- **Per-segment fallback** — if the translate pass produced 0 segments for a chunk but the codemix pass succeeded, re-submit just the affected chunk to Saaras `mode=translate` once before failing. Adds ~1 retry budget but rescues isolated translate-pass blips.
 
 ---
 
@@ -406,7 +399,7 @@ for msg in resp.get("Messages", []):
 
 **File:** `rate_limit.py`
 
-All Sarvam API calls (transcription + translation) share a single global sliding-window rate limiter capped at `SARVAM_RPM_LIMIT` (default 100 RPM).
+All Sarvam API calls (codemix + translate Saaras passes) share a single global sliding-window rate limiter capped at `SARVAM_RPM_LIMIT` (default 100 RPM). Per-chunk concurrency doubles vs the old single-pass design, but the global throttle keeps the absolute Sarvam RPS unchanged.
 
 ```
 Before every Sarvam call → throttle()
@@ -423,15 +416,12 @@ This is a sliding window (not a fixed 60s bucket), so the rate is smooth with no
 
 | Error | Handling |
 |-------|----------|
-| Sarvam 429 rate limit | Wait 60s explicitly, then retry via `@retry` |
-| Sarvam 5xx / network timeout | `@retry` exponential backoff (3–4 attempts, 5s–60s) |
-| Chunk transcription failure | Raises immediately — job emits `job.failed` event, no results file written |
-| Translation batch split mismatch | Re-translate each segment individually |
-| Mayura 400 / input exceeds limit | Sentence-split (`।` / `.?!`), translate pieces, rejoin |
-| Auto language detection failure | Retry with `hi-IN` explicit source |
-| `en-IN` output still in Indic script (auto-detect passthrough) | Surgical retry with Lingua-picked Indic source (Hindi vs Marathi disambiguation, 11-language allow-list, 0.75 confidence floor), falls back to script-range regex; pre-split if >950 chars |
-| Translation segment failure | Empty string in the segment's `translation` field, pipeline continues |
-| pyannote / diarization | Removed — not used. Sarvam provides per-chunk diarization |
+| Sarvam 429 rate limit (either Saaras pass) | Wait 60s explicitly, then retry via `@retry` |
+| Sarvam 5xx / network timeout | `@retry` exponential backoff (3 attempts, 10s–60s) |
+| Chunk codemix-pass failure (after retries) | Raises immediately — job emits `job.failed` event, no results file written |
+| Chunk translate-pass returns 0 segments | Logged at WARNING; chunk's transcription is preserved with empty `translation` per segment; the global coverage check at Stage 5 may still fail the job if too many chunks are affected |
+| Translation coverage below threshold | Job fails with `Translation failure rate X% for en-IN exceeds threshold Y%` and message redelivers (default `TRANSLATION_FAILURE_THRESHOLD=0.05`) |
+| pyannote / diarization | Removed — not used. Sarvam provides per-chunk diarization in both modes |
 | Audio over 60 min | VAD chunking with overlap — no size limit |
 | Video file input | ffmpeg extracts audio-only before processing |
 | No silence gap found | Force-cut 60s before hard chunk limit |
@@ -444,9 +434,10 @@ This is a sliding window (not a fixed 60s bucket), so the rate is smooth with no
 ## Job Status State Machine
 
 ```
-pending → downloading → chunking → transcribing → merging → translating → completed
-                                                                        ↓ (any stage)
-                                                                      failed
+pending → downloading → chunking → transcribing → merging → completed
+                                          (codemix + translate         ↓ (any stage)
+                                           Saaras passes run in              failed
+                                           parallel inside this stage)
 ```
 
 These states are emitted as **structured log lines** only — there is no
@@ -463,11 +454,10 @@ Most options are environment variables:
 | Variable | Default | Description |
 |---|---|---|
 | `SARVAM_API_KEY` | — | Sarvam API key (required) |
-| `SARVAM_RPM_LIMIT` | 100 | Requests per minute cap (transcription + translation) |
-| `SARVAM_MAX_CONCURRENT_CHUNKS` | 10 | Parallel transcription workers |
+| `SARVAM_RPM_LIMIT` | 100 | Requests per minute cap shared by both Saaras passes |
+| `SARVAM_MAX_CONCURRENT_CHUNKS` | 10 | Parallel chunks (each chunk fans out to 2 Saaras jobs internally) |
 | `SARVAM_BATCH_TIMEOUT_S` | 1800 | Max wait for a batch job (30 min) |
 | `SARVAM_BATCH_POLL_INTERVAL_S` | 10 | How often to poll batch job status |
-| `DEFAULT_TARGET_LANGUAGES` | `en` | Comma-separated Mayura target codes (e.g. `en,hi`) |
 | `TARGET_CHUNK_DURATION_S` | 2400 | Target chunk size (40 min) |
 | `MAX_CHUNK_DURATION_S` | 2700 | Hard max chunk size (45 min) |
 | `OVERLAP_DURATION_S` | 120 | Overlap prefix for speaker stitching (2 min) |
@@ -476,13 +466,13 @@ Most options are environment variables:
 | `S3_PROCESSED_BUCKET` | — | Bucket the worker PUTs the results JSON to. **Required** — the worker exits if unset. |
 | `S3_RESULTS_PREFIX` | `results/` | Key prefix inside the bucket. Each completed job writes `<prefix><job_id>.json`. |
 | `JOB_EVENTS_QUEUE_URL` | — | SQS queue for `job.completed` / `job.failed` events. Unset = no publish. Supports `.fifo` suffix. |
-| `TRANSLATION_FAILURE_THRESHOLD` | 0.05 | Max fraction of segments per language that may come back empty before the job is failed. |
+| `TRANSLATION_FAILURE_THRESHOLD` | 0.05 | Max fraction of segments where the translate-mode pass produced no overlapping output before the job is failed. |
 | `SQS_HEARTBEAT_INTERVAL_S` | 300 | How often the worker extends the input SQS message visibility. |
 | `SQS_HEARTBEAT_EXTEND_BY_S` | 3600 | How long to extend each heartbeat. |
 | `METRICS_NAMESPACE` | `AnchorVoice` | CloudWatch namespace the worker emits EMF metrics under. |
 | `METRICS_ENABLED` | `1` | Set to `0` / `false` to silence EMF emissions (useful in local dev). |
 
-**Translation batching (code constants in `translation.py`, not env):** max **900** characters and max **10** segments per translate batch; delimiter ` ⟦S⟧ `; **10** concurrent batch workers (`MAX_TRANSLATION_WORKERS`). Details under **Stage 5 — Translation** above.
+Target-language configuration is no longer settable — translation is always English, produced by Sarvam Saaras `mode=translate` running in parallel with the codemix transcription pass. The previous `DEFAULT_TARGET_LANGUAGES` env var (and the per-upload `Target-Languages` S3 metadata override) are removed.
 
 ---
 
@@ -500,7 +490,8 @@ The emitter is `worker/src/pipeline/metrics.py`.
 ### Metrics emitted
 
 All metrics carry the dimension `Service=worker`. Translation metrics add
-`Language=<target>` so they can be sliced per language.
+`Language=en-IN` (always English; the dimension is preserved for backward
+compatibility with dashboards that filter on it).
 
 | Metric | Unit | Emitted when | Dimensions |
 |---|---|---|---|
@@ -511,9 +502,9 @@ All metrics carry the dimension `Service=worker`. Translation metrics add
 | `SegmentsProcessed` | Count | Both outcomes | `Service` |
 | `SpeakersDetected` | Count | Both outcomes | `Service` |
 | `ChunksProcessed` | Count | Both outcomes | `Service` |
-| `TranslationSegments` | Count | Per language after translation | `Service`, `Language` |
-| `TranslationEmptySegments` | Count | Per language after translation | `Service`, `Language` |
-| `TranslationEmptyRate` | Percent | Per language after translation | `Service`, `Language` |
+| `TranslationSegments` | Count | After Stage 5 coverage check (count of non-empty source segments) | `Service`, `Language` |
+| `TranslationEmptySegments` | Count | After Stage 5 (segments where the translate-mode pass produced no overlapping output) | `Service`, `Language` |
+| `TranslationEmptyRate` | Percent | After Stage 5 | `Service`, `Language` |
 
 Dimension cardinality is deliberately bounded — no `job_id` or `s3_key` ends up
 as a metric dimension.

@@ -408,7 +408,6 @@ phase_ecs() {
       {"name": "S3_RESULTS_PREFIX",            "value": "${S3_RESULTS_PREFIX}"},
       {"name": "SARVAM_SECRET_NAME",           "value": "${SARVAM_SECRET_NAME}"},
       {"name": "JOB_EVENTS_QUEUE_URL",         "value": "${EVENTS_QUEUE_URL}"},
-      {"name": "DEFAULT_TARGET_LANGUAGES",     "value": "en"},
       {"name": "SARVAM_RPM_LIMIT",             "value": "100"},
       {"name": "TRANSLATION_FAILURE_THRESHOLD","value": "0.05"},
       {"name": "METRICS_NAMESPACE",            "value": "AnchorVoice"}
@@ -490,8 +489,7 @@ phase_lambda() {
     "ECS_SUBNETS":         "${SUBNETS}",
     "ECS_SECURITY_GROUPS": "${ECS_SG}",
     "ECS_ASSIGN_PUBLIC_IP":"ENABLED",
-    "SQS_QUEUE_URL":       "${INPUT_QUEUE_URL}",
-    "TARGET_LANGUAGES":    "en"
+    "SQS_QUEUE_URL":       "${INPUT_QUEUE_URL}"
   }
 }
 EOF

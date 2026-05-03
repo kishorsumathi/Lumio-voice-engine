@@ -28,14 +28,13 @@ import structlog
 
 from .audio import convert_to_mono_wav, get_duration
 from .chunking import chunk_audio
-from .config import DEFAULT_TARGET_LANGUAGES, TRANSLATION_FAILURE_THRESHOLD
+from .config import TRANSLATION_FAILURE_THRESHOLD
 from .events import publish_job_event
 from .merger import merge
 from .metrics import emit_job_outcome, emit_translation_coverage
 from .results_writer import build_results_document, write_results
-from .s3 import download_audio, get_object_metadata
+from .s3 import download_audio
 from .transcription import transcribe_all_chunks
-from .translation import translate_segments
 
 # ── Structured logging ────────────────────────────────────────────────────────
 structlog.configure(
@@ -116,7 +115,6 @@ def _delete_sqs_message(queue_url: str | None, receipt_handle: str | None) -> No
 def process_job(
     s3_bucket: str,
     s3_key: str,
-    target_languages: list[str] | None = None,
     receipt_handle: str | None = None,
     queue_url: str | None = None,
 ) -> uuid.UUID:
@@ -152,18 +150,6 @@ def process_job(
             log.info("status=downloading")
             audio_path = download_audio(s3_bucket, s3_key, work_dir)
 
-            # Per-upload target languages override via S3 object metadata
-            # (set by the Streamlit UI on PutObject). Kept for parity with
-            # the old flow — in practice this product is English-only.
-            meta = get_object_metadata(s3_bucket, s3_key)
-            meta_langs_raw = meta.get("target-languages") or meta.get("Target-Languages")
-            if meta_langs_raw:
-                meta_langs = [x.strip() for x in meta_langs_raw.split(",") if x.strip()]
-                if meta_langs:
-                    log.info("Target languages from S3 metadata override env",
-                             languages=meta_langs)
-                    target_languages = meta_langs
-
             # ── 2. Normalize to 16 kHz mono PCM WAV up-front ─────────────
             # One canonical format for the whole pipeline. The resulting
             # WAV always has a usable RIFF duration header, which fixes
@@ -185,7 +171,14 @@ def process_job(
             num_chunks = len(chunks)
             log.info("Chunks created", count=num_chunks)
 
-            # ── 4. Transcribe chunks (parallel) ───────────────────────────
+            # ── 4. Transcribe + translate chunks (parallel) ───────────────
+            # `transcribe_all_chunks` runs TWO Saaras batch jobs per chunk:
+            #   - mode=codemix   → original-language transcription + diarization
+            #   - mode=translate → English text, mapped onto codemix segments
+            #                       by timestamp overlap
+            # Both jobs run in parallel; the codemix pass owns the canonical
+            # timeline / speaker IDs. Each returned `TranscriptSegment` has
+            # `text` (original) and `translation` (English) populated.
             log.info("status=transcribing", num_chunks=num_chunks)
             transcript_segments = transcribe_all_chunks(chunks)
             log.info("Transcription complete", num_segments=len(transcript_segments))
@@ -196,50 +189,37 @@ def process_job(
             num_segments = len(merged)
             log.info("Merge complete", num_merged=num_segments)
 
-            # ── 6. Translate ──────────────────────────────────────────────
-            langs = target_languages or DEFAULT_TARGET_LANGUAGES
-            log.info("status=translating", languages=langs)
-            translations = translate_segments(merged, langs)
-
-            # Surface silent translation batch failures. translate_segments
-            # stores "" for segments whose batch raised — we compare against
-            # the non-empty source to get the real failure rate per language.
+            # ── 6. Translation coverage check ─────────────────────────────
+            # Translation is produced inline by Sarvam's translate pass and
+            # carried on each merged segment. Empty `translation` on a
+            # non-empty `text` means the translate pass produced no segment
+            # whose timestamps overlapped this transcription segment.
             nonempty_src = sum(1 for s in merged if s.text.strip())
-            for lang, trans_list in translations.items():
-                empty = sum(
-                    1 for t in trans_list
-                    if not t.translated_text.strip()
-                    and merged[t.segment_index].text.strip()
+            empty = sum(
+                1 for s in merged
+                if not s.translation.strip() and s.text.strip()
+            )
+            fail_rate = (empty / nonempty_src) if nonempty_src else 0.0
+            log.info(
+                "Translation coverage",
+                language="en-IN",
+                empty_segments=empty,
+                nonempty_source=nonempty_src,
+                failure_rate=round(fail_rate, 4),
+            )
+            emit_translation_coverage(
+                language="en-IN",
+                empty_segments=empty,
+                nonempty_source=nonempty_src,
+            )
+            if fail_rate > TRANSLATION_FAILURE_THRESHOLD:
+                raise RuntimeError(
+                    f"Translation failure rate {fail_rate:.1%} for en-IN "
+                    f"exceeds threshold {TRANSLATION_FAILURE_THRESHOLD:.1%} "
+                    f"({empty}/{nonempty_src} segments empty)"
                 )
-                fail_rate = (empty / nonempty_src) if nonempty_src else 0.0
-                log.info(
-                    "Translation coverage",
-                    language=lang,
-                    empty_segments=empty,
-                    nonempty_source=nonempty_src,
-                    failure_rate=round(fail_rate, 4),
-                )
-                emit_translation_coverage(
-                    language=lang,
-                    empty_segments=empty,
-                    nonempty_source=nonempty_src,
-                )
-                if fail_rate > TRANSLATION_FAILURE_THRESHOLD:
-                    raise RuntimeError(
-                        f"Translation failure rate {fail_rate:.1%} for {lang} "
-                        f"exceeds threshold {TRANSLATION_FAILURE_THRESHOLD:.1%} "
-                        f"({empty}/{nonempty_src} segments empty)"
-                    )
 
             # ── 7. Assemble + persist results JSON to S3 ──────────────────
-            # Always English. translate_segments() normalizes "en" → "en-IN"
-            # internally (Sarvam's canonical code) and keys its return dict
-            # with the normalized code, so we must look up "en-IN" — not the
-            # unnormalized env value. Keep "en" as a belt-and-braces fallback
-            # in case someone wires a Mayura-only code straight through.
-            # If `langs` is empty (translation disabled via env),
-            # `translations` is {} and we inline "" per segment.
-            english = translations.get("en-IN") or translations.get("en") or []
             num_speakers = len(set(s.speaker_id for s in merged))
             completed_at = datetime.now(timezone.utc)
 
@@ -253,7 +233,6 @@ def process_job(
                 num_speakers=num_speakers,
                 source_language=None,  # Sarvam auto-detects; we don't surface it per-job yet
                 merged=merged,
-                english_translation=english,
                 started_at=started_at,
                 completed_at=completed_at,
             )
@@ -348,9 +327,11 @@ def main():
     Entry point for ECS Fargate task.
 
     The Lambda that launches this task injects job parameters as environment
-    variables: S3_BUCKET, S3_KEY, TARGET_LANGUAGES, SQS_QUEUE_URL,
-    SQS_RECEIPT_HANDLE. `S3_PROCESSED_BUCKET` must be set on the task
-    definition — the worker writes the results JSON there.
+    variables: S3_BUCKET, S3_KEY, SQS_QUEUE_URL, SQS_RECEIPT_HANDLE.
+    `S3_PROCESSED_BUCKET` must be set on the task definition — the worker
+    writes the results JSON there. Translation is always English (produced
+    by Sarvam's translate-mode pass alongside transcription); there is no
+    target-language env var.
     """
     s3_bucket = os.environ.get("S3_BUCKET")
     s3_key = os.environ.get("S3_KEY")
@@ -365,24 +346,15 @@ def main():
         )
         sys.exit(1)
 
-    target_languages_raw = os.environ.get("TARGET_LANGUAGES", "")
-    target_languages = [x.strip() for x in target_languages_raw.split(",") if x.strip()] or None
-
     receipt_handle = os.environ.get("SQS_RECEIPT_HANDLE")
     queue_url = os.environ.get("SQS_QUEUE_URL")
 
-    logger.info(
-        "Worker starting",
-        s3_bucket=s3_bucket,
-        s3_key=s3_key,
-        target_languages=target_languages,
-    )
+    logger.info("Worker starting", s3_bucket=s3_bucket, s3_key=s3_key)
 
     try:
         job_id = process_job(
             s3_bucket=s3_bucket,
             s3_key=s3_key,
-            target_languages=target_languages,
             receipt_handle=receipt_handle,
             queue_url=queue_url,
         )
