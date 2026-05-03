@@ -10,9 +10,13 @@ Each audio chunk is submitted twice to Sarvam in parallel:
 
 The two jobs run on the same audio so timestamps are directly comparable.
 After both complete we attach English text to each transcription segment by
-**timestamp-overlap matching** — for every transcribe segment, all translate
-segments whose time window overlaps it are concatenated in chronological
-order and stored on `TranscriptSegment.translation`.
+**single-best-match timestamp overlap** — every translate segment is assigned
+to the one codemix segment it overlaps the most, and translate text then
+accumulates on that codemix segment in chronological order. This prevents a
+long translate segment from being duplicated across every short codemix
+segment it grazes (the failure mode that occurs around brief backchannels,
+overlapping speakers, and sentence-chopping disagreements between the two
+passes).
 
 This replaces the previous Mayura-text-translation step (and its language-
 detection fallback). Sarvam's `translate` mode handles code-mixed audio
@@ -207,11 +211,22 @@ def _zip_translation_into_segments(
     """
     Attach English text from `tr_segments` to `tx_segments` by timestamp overlap.
 
-    For each transcription segment, all translation segments whose time window
-    has any overlap with it are picked up and concatenated in chronological
-    order. Non-overlapping translation segments are silently dropped (they
-    would only happen if Sarvam diarized very differently between the two
-    runs — rare on the same audio).
+    Algorithm: each translate segment is assigned to **exactly one** codemix
+    segment — the one with the maximum temporal overlap. The translate text
+    then accumulates on that codemix segment in chronological order.
+
+    This is deliberately the inverse of the obvious "for each codemix seg,
+    grab every overlapping translate seg" zip. The naive approach duplicates
+    a long translate seg across every short codemix seg it touches, which
+    happens whenever the two passes disagree on speaker boundaries (brief
+    backchannels like "Hmm", overlapping speakers, sentence chopping). With
+    single-best-match assignment, each translate text appears at most once
+    in the final output.
+
+    Trade-off: a short codemix segment whose corresponding audio was
+    swallowed by an adjacent translate segment will have `translation == ""`.
+    That is correct behaviour — there is no translation text that belongs
+    uniquely to it. Empty is preferable to inheriting another speaker's text.
 
     Mutates the `translation` field of each `tx_segments` entry and returns
     the same list.
@@ -219,15 +234,35 @@ def _zip_translation_into_segments(
     if not tx_segments:
         return tx_segments
 
-    for tx in tx_segments:
-        overlapping: list[tuple[float, str]] = []
-        for tr in tr_segments:
-            overlap_start = max(tx.start_time, tr.start_time)
-            overlap_end = min(tx.end_time, tr.end_time)
-            if overlap_end > overlap_start:
-                overlapping.append((tr.start_time, tr.text))
-        overlapping.sort(key=lambda x: x[0])
-        tx.translation = " ".join(t for _, t in overlapping).strip()
+    pieces_by_tx: dict[int, list[tuple[float, str]]] = {}
+    unmatched = 0
+
+    for tr in tr_segments:
+        text = (tr.text or "").strip()
+        if not text:
+            continue
+        best_idx = -1
+        best_overlap = 0.0
+        for i, tx in enumerate(tx_segments):
+            overlap = min(tx.end_time, tr.end_time) - max(tx.start_time, tr.start_time)
+            if overlap > best_overlap:
+                best_overlap = overlap
+                best_idx = i
+        if best_idx >= 0:
+            pieces_by_tx.setdefault(best_idx, []).append((tr.start_time, text))
+        else:
+            unmatched += 1
+
+    for i, tx in enumerate(tx_segments):
+        pieces = pieces_by_tx.get(i, [])
+        pieces.sort(key=lambda x: x[0])
+        tx.translation = " ".join(t for _, t in pieces).strip()
+
+    if unmatched:
+        logger.warning(
+            "Chunk %d: %d translate segments had no overlapping codemix segment",
+            tx_segments[0].chunk_index, unmatched,
+        )
 
     return tx_segments
 
