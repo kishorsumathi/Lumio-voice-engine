@@ -25,7 +25,7 @@ help:
 	@echo "    make worker-push    Push image to ECR (repo: anchor-voice/worker)"
 	@echo ""
 	@echo "  Deployment (idempotent)"
-	@echo "    make deploy         Full deploy (requires SARVAM_API_KEY in env)"
+	@echo "    make deploy         Full deploy (reads .env; requires SARVAM_API_KEY)"
 	@echo "    make deploy-image   Rebuild image + register new task def revision only"
 	@echo "    make deploy-eventbridge  Wire S3 uploads to input SQS via EventBridge"
 	@echo "    make deploy-ui      Deploy Streamlit UI (ECR + IAM + SG + ECS service, public IP)"

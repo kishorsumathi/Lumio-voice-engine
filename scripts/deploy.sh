@@ -21,6 +21,18 @@
 set -euo pipefail
 IFS=$'\n\t'
 
+# ── Load .env from repo root (if present) ────────────────────────────────────
+# Variables already set in the shell take precedence over the file.
+SCRIPT_DIR_EARLY="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ENV_FILE="${SCRIPT_DIR_EARLY}/../.env"
+if [[ -f "${ENV_FILE}" ]]; then
+  # Export only KEY=VALUE lines; skip comments and blanks.
+  set -o allexport
+  # shellcheck disable=SC1090
+  source <(grep -E '^[A-Z_]+=.' "${ENV_FILE}" | grep -v '^#')
+  set +o allexport
+fi
+
 # ── Required inputs ──────────────────────────────────────────────────────────
 : "${SARVAM_API_KEY:?export SARVAM_API_KEY before running}"
 : "${AWS_REGION:=ap-south-1}"
