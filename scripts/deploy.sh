@@ -26,6 +26,11 @@ IFS=$'\n\t'
 : "${AWS_REGION:=ap-south-1}"
 : "${ENV:=prd}"
 : "${APP:=anchor-voice}"
+# Optional — enables LLM normalisation in the worker.
+# If set, the key is stored in Secrets Manager and the task def env is wired up.
+: "${ANTHROPIC_API_KEY:=}"
+: "${POSTPROCESS_ENABLED:=false}"
+: "${POSTPROCESS_MODEL:=claude-sonnet-4-6}"
 
 # ── Derived names (industry-standard scheme) ─────────────────────────────────
 NS="${APP}-${ENV}"
@@ -46,6 +51,7 @@ LOG_GROUP_WORKER="/ecs/${NS}-worker"
 LAMBDA_NAME="${NS}-job-dispatcher"
 LOG_GROUP_LAMBDA="/aws/lambda/${LAMBDA_NAME}"
 SARVAM_SECRET_NAME="${APP}/${ENV}/sarvam-api-key"
+ANTHROPIC_SECRET_NAME="${APP}/${ENV}/anthropic-api-key"
 EXEC_ROLE="${NS}-ecs-execution-role"
 TASK_ROLE="${NS}-worker-task-role"
 LAMBDA_ROLE="${NS}-job-dispatcher-role"
@@ -208,6 +214,22 @@ phase_storage() {
       --secret-string "${SARVAM_API_KEY}" >/dev/null
   fi
   ok "Secret: ${SARVAM_SECRET_NAME}"
+
+  # Anthropic secret — optional; only stored when ANTHROPIC_API_KEY is provided.
+  if [[ -n "${ANTHROPIC_API_KEY}" ]]; then
+    if aws secretsmanager describe-secret --secret-id "${ANTHROPIC_SECRET_NAME}" --region "${AWS_REGION}" >/dev/null 2>&1; then
+      aws secretsmanager put-secret-value --region "${AWS_REGION}" \
+        --secret-id "${ANTHROPIC_SECRET_NAME}" \
+        --secret-string "${ANTHROPIC_API_KEY}" >/dev/null
+    else
+      aws secretsmanager create-secret --region "${AWS_REGION}" \
+        --name "${ANTHROPIC_SECRET_NAME}" \
+        --secret-string "${ANTHROPIC_API_KEY}" >/dev/null
+    fi
+    ok "Secret: ${ANTHROPIC_SECRET_NAME}"
+  else
+    warn "ANTHROPIC_API_KEY not set — skipping Anthropic secret. LLM normalisation will be disabled."
+  fi
 }
 
 phase_network() {
@@ -334,6 +356,7 @@ phase_iam() {
     {"Sid":"ListAudioBucket","Effect":"Allow","Action":["s3:ListBucket"],"Resource":"arn:aws:s3:::${S3_BUCKET}"},
     {"Sid":"WriteResultsToS3","Effect":"Allow","Action":["s3:PutObject"],"Resource":"arn:aws:s3:::${S3_BUCKET}/${S3_RESULTS_PREFIX}*"},
     {"Sid":"ReadSarvamSecret","Effect":"Allow","Action":["secretsmanager:GetSecretValue"],"Resource":"arn:aws:secretsmanager:${AWS_REGION}:${AWS_ACCOUNT_ID}:secret:${SARVAM_SECRET_NAME}-*"},
+    {"Sid":"ReadAnthropicSecret","Effect":"Allow","Action":["secretsmanager:GetSecretValue"],"Resource":"arn:aws:secretsmanager:${AWS_REGION}:${AWS_ACCOUNT_ID}:secret:${ANTHROPIC_SECRET_NAME}-*"},
     {"Sid":"InputQueueLifecycle","Effect":"Allow","Action":["sqs:ChangeMessageVisibility","sqs:DeleteMessage","sqs:GetQueueAttributes"],"Resource":"${INPUT_QUEUE_ARN}"},
     {"Sid":"PublishCompletionEvents","Effect":"Allow","Action":["sqs:SendMessage"],"Resource":"${EVENTS_QUEUE_ARN}"},
     {"Sid":"WriteLogs","Effect":"Allow","Action":["logs:CreateLogStream","logs:PutLogEvents"],"Resource":"arn:aws:logs:${AWS_REGION}:${AWS_ACCOUNT_ID}:log-group:${LOG_GROUP_WORKER}:*"}
@@ -410,7 +433,10 @@ phase_ecs() {
       {"name": "JOB_EVENTS_QUEUE_URL",         "value": "${EVENTS_QUEUE_URL}"},
       {"name": "SARVAM_RPM_LIMIT",             "value": "100"},
       {"name": "TRANSLATION_FAILURE_THRESHOLD","value": "0.05"},
-      {"name": "METRICS_NAMESPACE",            "value": "AnchorVoice"}
+      {"name": "METRICS_NAMESPACE",            "value": "AnchorVoice"},
+      {"name": "POSTPROCESS_ENABLED",          "value": "${POSTPROCESS_ENABLED}"},
+      {"name": "POSTPROCESS_MODEL",            "value": "${POSTPROCESS_MODEL}"},
+      {"name": "ANTHROPIC_SECRET_NAME",        "value": "${ANTHROPIC_SECRET_NAME}"}
     ],
     "logConfiguration": {
       "logDriver": "awslogs",

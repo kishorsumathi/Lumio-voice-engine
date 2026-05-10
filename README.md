@@ -75,7 +75,9 @@ phase-addressable.
 
 ```bash
 export SARVAM_API_KEY='sk_...'
-export ANTHROPIC_API_KEY='sk-ant-...'   # optional — stored in Secrets Manager
+export ANTHROPIC_API_KEY='sk-ant-...'   # optional — stored in Secrets Manager; enables LLM normalisation
+export POSTPROCESS_ENABLED='true'       # optional — default false; set true to enable LLM normalisation
+export POSTPROCESS_MODEL='claude-sonnet-4-6'  # optional — default claude-sonnet-4-6
 export AWS_REGION='ap-south-1'          # optional (default ap-south-1)
 export ENV='prd'                        # optional — names all resources ${APP}-${ENV}-*
 make deploy                             # full stack
