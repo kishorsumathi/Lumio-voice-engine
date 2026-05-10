@@ -33,8 +33,14 @@ from .merger import MergedSegment
 logger = logging.getLogger(__name__)
 
 # ── Batch budget ──────────────────────────────────────────────────────────────
-# 80K chars keeps cleaned-output JSON comfortably under the 16K max_tokens cap.
-_BATCH_BUDGET_CHARS = 80_000
+# 40K input chars → ~10K output tokens — leaves comfortable headroom under the
+# 64K max_tokens cap even when the model expands content with corrections.
+_BATCH_BUDGET_CHARS = 40_000
+
+# If the model returns fewer than this fraction of expected turns, treat the
+# response as truncated and split the batch — guards against the structured
+# output path silently returning empty turns when max_tokens is hit.
+_MIN_TURN_RATIO = 0.5
 
 
 # ── Pydantic schemas (structured output contract) ────────────────────────────
@@ -436,6 +442,16 @@ def _clean_batch(
             if attempt > 0:
                 messages.append(HumanMessage(content=reminders[attempt - 1]))
             parsed = _invoke(llm, messages)
+            # Structured-output path swallows max_tokens truncation silently —
+            # it can return _CleanedBatch with turns=[] (or far fewer turns
+            # than expected) and no exception. Treat that as truncation and
+            # let the split-on-truncation logic below split + recurse.
+            min_turns = max(1, int(len(batch_segs) * _MIN_TURN_RATIO))
+            if len(parsed.turns) < min_turns:
+                raise _TruncatedError(
+                    f"Got {len(parsed.turns)} turns, expected {len(batch_segs)} "
+                    f"(min {min_turns}) — likely silent max_tokens truncation"
+                )
             return _align(batch_segs, parsed)
         except _TruncatedError:
             mid = len(batch_segs) // 2
@@ -491,7 +507,7 @@ def run_postprocess(
         model=model,
         anthropic_api_key=api_key,
         temperature=0.0,
-        max_tokens=16384,
+        max_tokens=64000,
     )
 
     # Each MergedSegment becomes one turn (1:1 mapping, no grouping).
