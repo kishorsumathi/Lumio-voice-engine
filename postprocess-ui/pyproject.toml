@@ -1,0 +1,14 @@
+[project]
+name = "postprocess-ui"
+version = "0.1.0"
+description = "Streamlit portal — Anthropic Claude post-processing for Anchor Voice results JSON"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "streamlit>=1.33",
+    "langchain>=0.3",
+    "langchain-core>=0.3",
+    "langchain-anthropic>=0.3",
+    "pydantic>=2.6",
+    "python-dotenv>=1.0",
+]
