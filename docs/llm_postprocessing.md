@@ -278,7 +278,7 @@ plaud
 
 ## Stage 4 — Output Validation
 
-Claude's output goes through four independent validation layers. Each layer is a fallback for the one above it. The system never crashes — the worst outcome is uncleaned text passed through unchanged.
+Claude's output goes through five independent validation layers. Each layer is a fallback for the one above it. The system never crashes — the worst outcome is uncleaned text passed through unchanged.
 
 ### Layer 1 — API-level schema enforcement
 
@@ -300,6 +300,9 @@ Path 2: tool_calling mode  (this is what runs almost always)
 
 Path 3: raw invoke + manual parse
   llm.invoke(messages) → free-form text response
+  → _is_truncated(): checks stop_reason == "max_tokens" first
+      → if truncated: raises _OutputTruncatedError immediately
+         (signals the caller to split — do not retry the same size)
   → _extract_message_text(): extracts string from response content blocks
   → _parse_json_object():
       1. Strip <think>...</think> reasoning blocks
@@ -309,9 +312,30 @@ Path 3: raw invoke + manual parse
   → Raises ValueError if no valid JSON found
 ```
 
-### Layer 2 — Retry loop with correction message
+### Layer 2 — Output truncation: split and recurse
 
-`clean_batch()` wraps `_invoke_cleaned_turns()` in a **3-attempt loop**. On each failure it appends a correction message to the conversation before retrying. Claude sees its previous bad response and the specific instruction to fix it:
+When the model hits `max_tokens`, the JSON is cut off mid-object. Retrying the same batch always fails the same way. `clean_batch()` catches `_OutputTruncatedError` and **splits the batch in half**, recursing each half independently:
+
+```
+Batch of 40 turns  →  hits max_tokens  →  split into 20 + 20
+                                               │
+                               ┌───────────────┴───────────────┐
+                            20 turns                        20 turns
+                            still truncates?                still truncates?
+                            split to 10 + 10               split to 10 + 10
+                                ...                             ...
+                            eventually fits                 eventually fits
+                               │                               │
+                            CleanedTurns                   CleanedTurns
+                               └───────────────┬───────────────┘
+                                         merged result
+```
+
+Glossary corrections from both halves are merged and deduplicated. The recursion stops at a single turn — if a single turn still truncates (a pathologically long turn producing >16K output tokens), it is passed through uncleaned with a warning rather than looping forever.
+
+### Layer 3 — Retry loop with correction message
+
+For non-truncation failures (bad JSON, schema mismatch, empty response), `clean_batch()` retries up to **3 times**, appending a correction message to the conversation on each attempt so Claude sees what it got wrong:
 
 ```
 Attempt 1:
@@ -329,7 +353,9 @@ Attempt 3 (if attempt 2 failed):
    HumanMessage("Final attempt — emit valid JSON only.")]
 ```
 
-### Layer 3 — Gap filling
+Note: `_OutputTruncatedError` bypasses this loop entirely — there is no point retrying the same size batch.
+
+### Layer 4 — Gap filling
 
 `_align_to_batch()` runs after every successful `_invoke_cleaned_turns()` call. Even with a valid `CleanedTurns` object, Claude may have silently skipped a turn or returned a wrong `turn_index`. This function walks the original batch and fills any missing turns with the original uncleaned text:
 
@@ -347,21 +373,22 @@ for b in batch:                         # walk original batch in order
         fixed.append(ct)                # use Claude's cleaned output
 ```
 
-### Layer 4 — Total failure passthrough
+### Layer 5 — Total failure passthrough
 
-If all three retry attempts in `clean_batch()` raise exceptions, `_fallback_identity()` is returned — every turn in the batch passes through with original text unchanged. The batch is logged as failed, but the rest of the document continues processing normally.
+If all three retry attempts in `clean_batch()` raise exceptions (after truncation splits have already been exhausted), `_fallback_identity()` is returned — every turn in the batch passes through with original text unchanged. The batch is logged as failed, but the rest of the document continues processing normally.
 
 ```
-clean_batch() decision tree:
+clean_batch() full decision tree:
 
-  attempt 1  →  success  →  _align_to_batch  →  done
-             →  failure  →  log warning
+  _OutputTruncatedError on any attempt
+      → split batch in half, recurse each half independently
+      → single-turn truncation → passthrough uncleaned (no infinite loop)
 
-  attempt 2  →  success  →  _align_to_batch  →  done
-             →  failure  →  log warning
+  other exception on attempt 1  →  log warning, retry
+  other exception on attempt 2  →  log warning, retry
+  other exception on attempt 3  →  _fallback_identity (original text, no crash)
 
-  attempt 3  →  success  →  _align_to_batch  →  done
-             →  failure  →  _fallback_identity (original text, no crash)
+  success on any attempt  →  _align_to_batch  →  done
 ```
 
 **What is NOT validated:** content quality — whether Claude correctly restored the Devanagari, removed the right fillers, or fixed the right medication name. That is entirely the prompt's responsibility. The code validates only structure (correct keys, correct types, correct number of turns).
