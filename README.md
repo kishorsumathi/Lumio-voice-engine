@@ -19,8 +19,12 @@ S3 upload → EventBridge → SQS FIFO → Lambda → ECS Fargate
                                         │        attaches English to        │
                                         │        each transcription seg)    │
                                         │  3. Cross-chunk speaker stitching │
-                                        │  4. Write results JSON ───────────┼──► S3 (results/ prefix)
-                                        │  5. Publish pointer event ────────┼──► SQS job-events queue
+                                        │  4. LLM normalisation (optional) ─┼──► Anthropic Claude
+                                        │       fix clinical terms,         │    (claude-sonnet-4-6)
+                                        │       restore romanised script,   │
+                                        │       clean formatting + noise    │
+                                        │  5. Write results JSON ───────────┼──► S3 (results/ prefix)
+                                        │  6. Publish pointer event ────────┼──► SQS job-events queue
                                         └───────────────────────────────────┘
 ```
 
@@ -38,12 +42,13 @@ Full architecture, pipeline stages, error handling, and edge cases: **[docs/arch
 - Docker Desktop
 - AWS CLI configured (`aws configure`)
 - Sarvam API key ([sarvam.ai](https://sarvam.ai))
+- Anthropic API key ([console.anthropic.com](https://console.anthropic.com)) — for the LLM normalisation step (optional; pipeline runs without it)
 
 ## Local Development
 
 ```bash
 cp .env.example .env
-# Fill in: SARVAM_API_KEY
+# Fill in: SARVAM_API_KEY, ANTHROPIC_API_KEY (optional — for normalisation)
 
 cd worker && uv sync && cd ..
 
@@ -54,6 +59,15 @@ This writes `<stem>_results.json` (same schema the worker PUTs to S3 per job)
 and `<stem>_transcript.txt` (human-readable speaker + timestamp layout)
 next to the input audio. No AWS, no DB.
 
+To run the post-processing UI locally against an existing results JSON:
+
+```bash
+cd postprocess-ui
+echo "ANTHROPIC_API_KEY=sk-ant-..." > .env
+uv sync
+uv run streamlit run app.py
+```
+
 ## Deploy to AWS
 
 End-to-end deploy is scripted — `scripts/deploy.sh` is idempotent and
@@ -61,10 +75,11 @@ phase-addressable.
 
 ```bash
 export SARVAM_API_KEY='sk_...'
-export AWS_REGION='ap-south-1'     # optional (default ap-south-1)
-export ENV='prd'                   # optional — names all resources ${APP}-${ENV}-*
-make deploy                        # full stack
-make deploy-image                  # rebuild image + new task def revision only
+export ANTHROPIC_API_KEY='sk-ant-...'   # optional — stored in Secrets Manager
+export AWS_REGION='ap-south-1'          # optional (default ap-south-1)
+export ENV='prd'                        # optional — names all resources ${APP}-${ENV}-*
+make deploy                             # full stack
+make deploy-image                       # rebuild image + new task def revision only
 ```
 
 See [docs/architecture.md](docs/architecture.md) for the full AWS resource list and wiring.
@@ -94,6 +109,7 @@ Uploads land at `uploads/{uuid}/{filename}` which EventBridge already routes to 
 ├── worker/                     # ECS Fargate container
 │   ├── Dockerfile
 │   ├── pyproject.toml
+│   ├── glossary.json           # Clinical terms + ASR corrections fed to LLM normalisation
 │   └── src/pipeline/
 │       ├── main.py             # Orchestrator + SQS heartbeat (no DB)
 │       ├── config.py           # All env vars + Secrets Manager
@@ -101,10 +117,17 @@ Uploads land at `uploads/{uuid}/{filename}` which EventBridge already routes to 
 │       ├── chunking.py         # VAD-based smart splitting with overlap
 │       ├── transcription.py    # Dual Saaras pass per chunk (codemix + translate) + overlap zip
 │       ├── merger.py           # Cross-chunk speaker stitching
+│       ├── postprocess.py      # LLM normalisation pass (Claude) — clinical terms, script restore
 │       ├── results_writer.py   # Serialize + PUT results JSON to S3 (claim-check)
 │       ├── events.py           # Publish job.completed (pointer) / job.failed (error) to SQS
 │       ├── rate_limit.py       # Shared 100 RPM sliding-window limiter
 │       └── metrics.py          # CloudWatch EMF emitter
+├── postprocess-ui/             # Standalone Streamlit portal for manual post-processing
+│   ├── app.py                  # Upload results JSON, run Claude, review diff, download
+│   ├── pipeline.py             # Batching, retries, structured output, truncation handling
+│   ├── llm.py                  # ChatAnthropic factory
+│   ├── prompt.py               # Full clinical editor system prompt
+│   └── schema.py               # Pydantic models
 ├── ui/                         # Streamlit review app — S3-backed (no DB)
 │   ├── app.py                  # Upload + sidebar + transcript renderer
 │   ├── s3_results.py           # List + HEAD + GET helpers for results/ prefix
@@ -115,7 +138,8 @@ Uploads land at `uploads/{uuid}/{filename}` which EventBridge already routes to 
 │   ├── run_local.py            # Local pipeline runner (no AWS, no DB)
 │   └── create_dashboard.sh     # Install / update CloudWatch dashboard
 ├── docs/
-│   └── architecture.md         # Full architecture + edge case reference
+│   ├── architecture.md         # Full pipeline architecture + edge case reference
+│   └── llm_postprocessing.md   # LLM normalisation design, prompt, validation layers
 └── Makefile
 ```
 
@@ -138,23 +162,35 @@ pointer (bucket + key + size + etag) into this object.
     {
       "segment_index": 0, "chunk_index": 0, "speaker_id": 0,
       "start_time": 0.000, "end_time": 8.420,
-      "transcription": "Namaste doston, aaj ke episode mein…",
-      "translation":   "Hello friends, in today's episode we…",
+      "transcription":          "haan I I I feel like mood bahut low hai",
+      "translation":            "yes I feel like mood is very low",
+      "normalized_transcript":  "हाँ, I feel like mood बहुत low है।",
+      "normalized_translation": "Yes, I feel like my mood has been very low.",
       "confidence": 0.942
     }
-  ]
+  ],
+  "postprocess": {
+    "model": "claude-sonnet-4-6",
+    "glossary_corrections": [
+      { "heard": "cat distributing", "corrected": "catastrophising" }
+    ]
+  }
 }
 ```
+
+`normalized_transcript` and `normalized_translation` are empty strings when
+`POSTPROCESS_ENABLED=false` or `ANTHROPIC_API_KEY` is absent. The `postprocess`
+key is `null` in those cases.
 
 Full schema and consumer sketch: [docs/architecture.md](docs/architecture.md#stage-6--results-persistence-s3-claim-check).
 
 ## Key Design Decisions
 
 - **No database** — results are stored in S3 (one JSON per job, claim-check); the SQS event carries only a pointer. Backend consumers do one S3 GET per completion event. Missed events are recoverable by listing the `results/` prefix.
-- **No pyannote / no diarization model** — Sarvam provides per-chunk diarization; overlap text matching stitches speaker IDs across chunks
+- **No pyannote / no diarization model** — Sarvam provides per-chunk diarization; overlap text matching stitches speaker IDs across chunks.
 - **No NAT gateway** — ECS runs in public subnets with `assignPublicIp=ENABLED`; saves ~$32/month. No RDS, no private subnets.
-- **Sarvam-only, single product, two modes** — transcription uses Saaras v3 `mode=codemix`, translation uses Saaras v3 `mode=translate`. No Mayura, no language-detection sidecar (`lingua` removed). Both Saaras passes run in parallel per chunk; their outputs are merged by timestamp overlap (the codemix pass owns the canonical timeline + speaker IDs).
-- **Why two Saaras passes instead of Mayura on the transcript** — Saaras `mode=translate` handles dense Hinglish / code-switched audio natively, sidestepping the failure mode where Mayura's `auto`-source detector treated romanized Hindi as English and passed it through unchanged. The whole `translation.py` + `lang_detect.py` retry/repair stack (≈ 700 lines) is gone.
+- **Sarvam-only, single product, two modes** — transcription uses Saaras v3 `mode=codemix`, translation uses Saaras v3 `mode=translate`. No Mayura, no language-detection sidecar. Both passes run in parallel per chunk; outputs are merged by timestamp overlap.
+- **LLM normalisation pass (optional)** — after Sarvam transcription, Claude runs a clinical editing pass: fixes misheard medical terms, restores romanised Indian-language text to native script (e.g. "ab dekho" → "अब देखो"), fixes formatting and removes ASR noise. Controlled via `POSTPROCESS_ENABLED` / `ANTHROPIC_SECRET_NAME`. Failures are logged and skipped — they never block job completion. Glossary of clinical terms and ASR corrections lives in `worker/glossary.json`. Full design in [docs/llm_postprocessing.md](docs/llm_postprocessing.md).
 - **100 RPM shared** — single sliding-window rate limiter across all Sarvam calls. The throttle is per-API-call, so the doubled per-chunk concurrency (codemix + translate) doesn't change the absolute Sarvam request rate.
-- **Sarvam STT audio** — Every batch upload is **16 kHz, mono, 16-bit WAV (`pcm_s16le`)** per [Sarvam's STT FAQ](https://docs.sarvam.ai/api-reference-docs/speech-to-text/faq). Sessions **≤ 60 min** use one `chunk_000.wav` (no VAD split / stitch — typical medical session). Longer audio: one full-file normalize, **VAD on that master**, then overlapping **`chunk_NNN.wav`** slices via ffmpeg **stream copy** (no per-chunk resample).
-- **Claim-check completion events** — on success the SQS event is a pointer to `s3://<processed-bucket>/results/<job_id>.json`; on failure it carries `error_message` inline (no results file is written). Schema and consumer sketch in [docs/architecture.md](docs/architecture.md#stage-7--completion-event-claim-check-pointer).
+- **Sarvam STT audio** — Every batch upload is **16 kHz, mono, 16-bit WAV (`pcm_s16le`)** per [Sarvam's STT FAQ](https://docs.sarvam.ai/api-reference-docs/speech-to-text/faq). Sessions **≤ 60 min** use one `chunk_000.wav`. Longer audio: one full-file normalize, VAD on that master, then overlapping slices via ffmpeg stream copy.
+- **Claim-check completion events** — on success the SQS event is a pointer to `s3://<processed-bucket>/results/<job_id>.json`; on failure it carries `error_message` inline. Schema and consumer sketch in [docs/architecture.md](docs/architecture.md).

@@ -45,8 +45,11 @@ Target users: doctors, therapists, psychiatrists recording clinical sessions.
 │  │         (timestamp-overlap zip merges      │                 │
 │  │          translation onto transcription)   │                 │
 │  │    4. Overlap speaker stitching            │                 │
-│  │    5. Write results JSON ──────────────────┼─► S3 (results/) │
-│  │    6. Publish pointer event ───────────────┼─► SQS events    │
+│  │    5. LLM normalisation (optional) ────────┼─► Anthropic API │
+│  │         clinical terms, script restore,    │  (Claude Sonnet) │
+│  │         formatting, noise removal          │                 │
+│  │    6. Write results JSON ──────────────────┼─► S3 (results/) │
+│  │    7. Publish pointer event ───────────────┼─► SQS events    │
 │  └────────────────────────────────────────────┘                 │
 │                                                                 │
 │  SQS job-events queue  ──► Backend consumer (reads results JSON │
@@ -206,7 +209,44 @@ After stitching:
 
 ---
 
-### Stage 5 — Translation coverage check
+### Stage 5 — LLM Normalisation (optional)
+
+**File:** `postprocess.py`
+
+After Sarvam transcription and the translation coverage check, an optional Claude pass cleans every segment's transcription and translation. This step is skipped silently if `POSTPROCESS_ENABLED=false` or `ANTHROPIC_API_KEY` / `ANTHROPIC_SECRET_NAME` is absent — it never blocks job completion.
+
+**What it fixes:**
+
+| Problem | Example (before → after) |
+|---|---|
+| Clinical term mishearing | "cat distributing" → "catastrophising" |
+| Romanised Indian-language text | "ab dekho" → "अब देखो" (Devanagari) |
+| ASR filler and stutters | "I I I was thinking um maybe" → "I was thinking maybe" |
+| Missing punctuation | run-on sentences → proper sentence boundaries |
+| Wrong casing | "ssri" → "SSRI", "Sertraline" → "sertraline" |
+
+**Output fields added per segment:**
+- `normalized_transcript` — cleaned transcription, Indian-language text in native script
+- `normalized_translation` — cleaned fluent English translation
+
+**Glossary:** `worker/glossary.json` is bundled in the Docker image and read at runtime. Contains two arrays:
+- `corrections` — ASR mishearings with their correct form: `{"heard": "sir traline", "corrected": "sertraline"}`
+- `terms` — authoritative spellings Claude must preserve: `"sertraline"`, `"CBT"`, `"sukoon"`
+
+Override the path at runtime with `GLOSSARY_FILE_PATH`.
+
+**Validation layers** (from `postprocess.py`):
+1. Structured output via API schema enforcement (tool_calling mode)
+2. Output truncation detection — splits batch in half and recurses if `stop_reason=max_tokens`
+3. Up to 3 retries with correction messages appended to the conversation
+4. Gap-fill: any turn Claude skips gets original text passed through unchanged
+5. Total failure: `_fallback_identity` returns original text — no crash
+
+Full design reference: [docs/llm_postprocessing.md](llm_postprocessing.md)
+
+---
+
+### Stage 6 — Translation coverage check
 
 **File:** `main.py` (no separate translation module — see Stage 3).
 
@@ -234,7 +274,7 @@ These were considered for Phase 1 and intentionally deferred — the simple over
 
 ---
 
-### Stage 6 — Results persistence (S3 claim-check)
+### Stage 7 — Results persistence (S3 claim-check)
 
 **File:** `results_writer.py`
 
@@ -290,12 +330,21 @@ Why a claim-check over inlining in SQS:
       "speaker_id": 0,
       "start_time": 0.000,
       "end_time": 8.420,
-      "transcription": "Namaste doston, aaj ke episode mein hum…",
-      "translation":   "Hello friends, in today's episode we will…",
+      "transcription":          "haan I I I feel like mood bahut low hai",
+      "translation":            "yes I feel like mood is very low",
+      "normalized_transcript":  "हाँ, I feel like mood बहुत low है।",
+      "normalized_translation": "Yes, I feel like my mood has been very low.",
       "confidence": 0.942
     }
     // … one entry per merged speaker turn
-  ]
+  ],
+  // null when POSTPROCESS_ENABLED=false or ANTHROPIC_API_KEY absent
+  "postprocess": {
+    "model": "claude-sonnet-4-6",
+    "glossary_corrections": [
+      { "heard": "cat distributing", "corrected": "catastrophising" }
+    ]
+  }
 }
 ```
 
@@ -310,7 +359,7 @@ Objects are written with `ContentType: application/json; charset=utf-8` and
 
 ---
 
-### Stage 7 — Completion event (claim-check pointer)
+### Stage 8 — Completion event (claim-check pointer)
 
 **File:** `events.py`
 
@@ -434,11 +483,14 @@ This is a sliding window (not a fixed 60s bucket), so the rate is smooth with no
 ## Job Status State Machine
 
 ```
-pending → downloading → chunking → transcribing → merging → completed
-                                          (codemix + translate         ↓ (any stage)
-                                           Saaras passes run in              failed
-                                           parallel inside this stage)
+pending → downloading → chunking → transcribing → merging → [normalising] → completed
+                                          (codemix + translate    (optional,      ↓ (any stage)
+                                           Saaras passes run in   skipped if         failed
+                                           parallel inside        no API key)
+                                           this stage)
 ```
+
+`normalising` is skipped silently if `POSTPROCESS_ENABLED=false` or the Anthropic API key is absent. A normalisation failure is logged as a warning and the job continues to `completed` with empty `normalized_transcript` / `normalized_translation` fields.
 
 These states are emitted as **structured log lines** only — there is no
 database row tracking them. `completed` corresponds to a results JSON in S3
@@ -471,6 +523,11 @@ Most options are environment variables:
 | `SQS_HEARTBEAT_EXTEND_BY_S` | 3600 | How long to extend each heartbeat. |
 | `METRICS_NAMESPACE` | `AnchorVoice` | CloudWatch namespace the worker emits EMF metrics under. |
 | `METRICS_ENABLED` | `1` | Set to `0` / `false` to silence EMF emissions (useful in local dev). |
+| `POSTPROCESS_ENABLED` | `true` | Set to `false` to skip the LLM normalisation step entirely. Pipeline completes normally with empty `normalized_transcript` / `normalized_translation`. |
+| `POSTPROCESS_MODEL` | `claude-sonnet-4-6` | Anthropic model for the normalisation pass. `claude-opus-4-6` for higher quality. |
+| `ANTHROPIC_API_KEY` | — | Direct API key (local dev). In production use `ANTHROPIC_SECRET_NAME` instead. |
+| `ANTHROPIC_SECRET_NAME` | `anchor-voice/anthropic-api-key` | Secrets Manager secret name for the Anthropic key. |
+| `GLOSSARY_FILE_PATH` | `/app/glossary.json` | Path to the clinical glossary JSON file. Bundled in the image; override to mount a custom file. |
 
 Target-language configuration is no longer settable — translation is always English, produced by Sarvam Saaras `mode=translate` running in parallel with the codemix transcription pass. The previous `DEFAULT_TARGET_LANGUAGES` env var (and the per-upload `Target-Languages` S3 metadata override) are removed.
 
@@ -651,7 +708,8 @@ aws logs tail /ecs/${NS}-worker --region ${AWS_REGION} --follow
 ## Data Privacy (Medical Use)
 
 - Audio never leaves Sarvam's API and your AWS infrastructure
-- No external LLM receives patient data (speaker stitching is text-similarity only)
+- **Transcript text is sent to the Anthropic API** during the LLM normalisation step. Disable with `POSTPROCESS_ENABLED=false` if patient data must not leave AWS. Anthropic's API processes only text (no audio). Review Anthropic's data processing agreement and HIPAA eligibility before production medical use.
+- Speaker stitching uses only text similarity (rapidfuzz) — no embeddings or external model
 - S3 buckets are private with `BlockPublicAcls=true` and SSE-S3 encryption at rest; results JSONs are written with `ServerSideEncryption: AES256`
 - All AWS services used are HIPAA-eligible (requires BAA with AWS)
 - Sarvam data processing agreement required before production medical use

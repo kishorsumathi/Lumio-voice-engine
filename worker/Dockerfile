@@ -48,6 +48,9 @@ COPY --from=builder --chown=app:app /root/.cache/torch /home/app/.cache/torch
 
 WORKDIR /app
 COPY --chown=app:app src/ ./src/
+# Bundled at build time; override at runtime with GLOSSARY_FILE_PATH env var
+# pointing to a volume-mounted or Secrets Manager-fetched file.
+COPY --chown=app:app glossary.json ./glossary.json
 
 ENV PATH="/opt/venv/bin:$PATH" \
     PYTHONPATH="/app/src" \
@@ -62,7 +65,8 @@ USER app
 # ECS injects at runtime:
 #   S3_BUCKET, S3_KEY,
 #   SQS_QUEUE_URL, SQS_RECEIPT_HANDLE,
-#   AWS_REGION, SARVAM_SECRET_NAME,
-#   S3_PROCESSED_BUCKET, S3_RESULTS_PREFIX, JOB_EVENTS_QUEUE_URL
+#   AWS_REGION, SARVAM_SECRET_NAME, ANTHROPIC_SECRET_NAME,
+#   S3_PROCESSED_BUCKET, S3_RESULTS_PREFIX, JOB_EVENTS_QUEUE_URL,
+#   POSTPROCESS_ENABLED, POSTPROCESS_MODEL (optional)
 
 ENTRYPOINT ["python", "-m", "pipeline.main"]

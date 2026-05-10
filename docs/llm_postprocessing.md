@@ -1,23 +1,27 @@
 # LLM Post-Processing — Architecture & Design
 
-The `postprocess-ui` is a second-pass quality layer that sits **after** the main ECS transcription pipeline. The ECS worker produces raw ASR output with speaker diarization. This system takes that raw JSON, sends it through Claude, and returns a cleaned version — fixing clinical terminology, script restoration, formatting, and filler noise.
+The LLM normalisation pass is a Claude-powered quality layer that runs **inside the ECS worker** after Sarvam transcription and translation, and is also available as a **standalone Streamlit portal** (`postprocess-ui/`) for manual review.
+
+The worker produces raw ASR output with speaker diarization. Claude fixes clinical terminology, restores romanised Indian-language text to native script, cleans formatting, and removes ASR noise — adding `normalized_transcript` and `normalized_translation` fields to every segment in the results JSON.
 
 ---
 
 ## Table of Contents
 
 1. [What Problem It Solves](#what-problem-it-solves)
-2. [System Overview](#system-overview)
-3. [Data Flow](#data-flow)
-4. [File Responsibilities](#file-responsibilities)
-5. [Stage 1 — Segment Grouping](#stage-1--segment-grouping)
-6. [Stage 2 — Batching](#stage-2--batching)
-7. [Stage 3 — The Prompt](#stage-3--the-prompt)
-8. [Stage 4 — Output Validation](#stage-4--output-validation)
-9. [Stage 5 — Assemble](#stage-5--assemble)
-10. [Output Schema](#output-schema)
-11. [Model Configuration](#model-configuration)
-12. [Running Locally](#running-locally)
+2. [Two Deployment Modes](#two-deployment-modes)
+3. [System Overview](#system-overview)
+4. [Data Flow](#data-flow)
+5. [File Responsibilities](#file-responsibilities)
+6. [Stage 1 — Segment Grouping](#stage-1--segment-grouping)
+7. [Stage 2 — Batching](#stage-2--batching)
+8. [Stage 3 — The Prompt](#stage-3--the-prompt)
+9. [Stage 4 — Output Validation](#stage-4--output-validation)
+10. [Stage 5 — Assemble](#stage-5--assemble)
+11. [Glossary File](#glossary-file)
+12. [Output Schema](#output-schema)
+13. [Model Configuration](#model-configuration)
+14. [Running Locally](#running-locally)
 
 ---
 
@@ -33,6 +37,19 @@ The raw pipeline output has four systematic failure modes:
 | ASR noise | "I I I was thinking um um maybe" |
 
 None of these are fixable at the ASR level. They require understanding the clinical domain, the language being spoken, and the conversational context. Claude handles all four in a single pass over each batch of turns.
+
+---
+
+## Two Deployment Modes
+
+The same core logic runs in two contexts:
+
+| Mode | Where | When to use |
+|---|---|---|
+| **Worker (automatic)** | `worker/src/pipeline/postprocess.py` | Every job — runs inline after Sarvam, before S3 write. Controlled by `POSTPROCESS_ENABLED` and `ANTHROPIC_SECRET_NAME`. Segments map 1:1 to turns (no grouping). |
+| **Standalone UI (manual)** | `postprocess-ui/` | Upload an existing `results.json` for manual review — shows side-by-side original vs normalised diff, supports custom glossary input, download cleaned JSON. Segments are grouped into speaker turns before sending to Claude. |
+
+In the worker, a normalisation failure is **never fatal** — it logs a warning and the job completes with empty `normalized_transcript` / `normalized_translation` fields. In the UI, errors are shown inline and you can retry.
 
 ---
 
@@ -405,6 +422,52 @@ Glossary corrections from all batches are deduplicated (by `heard + corrected` p
 
 ---
 
+## Glossary File
+
+**Location:** `worker/glossary.json` (bundled in the Docker image at `/app/glossary.json`)
+
+**Format:**
+
+```json
+{
+  "corrections": [
+    {"heard": "cat distributing", "corrected": "catastrophising"},
+    {"heard": "sir traline",      "corrected": "sertraline"}
+  ],
+  "terms": [
+    "sertraline",
+    "escitalopram",
+    "CBT",
+    "DBT",
+    "sukoon",
+    "plaud"
+  ]
+}
+```
+
+**`corrections`** — explicit wrong → right mappings for ASR mishearings. These are applied by Claude when it sees the `heard` form in context.
+
+**`terms`** — authoritative spellings that Claude must preserve exactly. No substitution rule — just tells Claude "this is the correct spelling, do not change it." Handles cases where ASR might phonetically mangle the same word differently each time (e.g. "setraline", "sertralene", "sir traline" → all should become `sertraline`).
+
+**What gets sent to Claude** (via `load_glossary()`):
+
+```
+cat distributing → catastrophising
+sir traline → sertraline
+sertraline
+escitalopram
+CBT
+DBT
+sukoon
+plaud
+```
+
+Injected into the system prompt inside a `<glossary>` XML block so Claude treats it as data, not additional instructions.
+
+**Overriding at runtime:** set `GLOSSARY_FILE_PATH` to point to a custom file — useful for mounting a per-deployment glossary via ECS task definition environment variables or a Secrets Manager fetch.
+
+---
+
 ## Output Schema
 
 Defined in `schema.py` as Pydantic models:
@@ -434,33 +497,61 @@ GlossaryCorrection
 
 ## Model Configuration
 
+### Worker (automatic, in-pipeline)
+
+| Env var | Default | Description |
+|---|---|---|
+| `POSTPROCESS_ENABLED` | `true` | Set `false` to skip entirely |
+| `POSTPROCESS_MODEL` | `claude-sonnet-4-6` | Anthropic model ID |
+| `ANTHROPIC_SECRET_NAME` | `anchor-voice/anthropic-api-key` | Secrets Manager secret (production) |
+| `ANTHROPIC_API_KEY` | — | Direct key (local dev) |
+| `GLOSSARY_FILE_PATH` | `/app/glossary.json` | Glossary file path inside the container |
+
+### Standalone UI
+
 | Setting | Default | Override |
 |---|---|---|
-| Model | `claude-opus-4-6` | `ANTHROPIC_MODEL_ID` env var or UI dropdown |
+| Model | `claude-opus-4-6` | UI dropdown |
 | Available models | `claude-opus-4-6`, `claude-sonnet-4-6` | UI dropdown |
-| Max output tokens | `16384` | `make_chat(max_tokens=...)` |
+| Max output tokens | `16384` | `make_chat(max_tokens=...)` in `llm.py` |
 | Temperature | `0.0` | `make_chat(temperature=...)` |
 | Batch size | `80000` chars | `_BATCH_BUDGET` in `pipeline.py` |
 
 **Choosing between models:**
-- `claude-opus-4-6` — highest quality; best at script restoration and clinical term inference; use for production
-- `claude-sonnet-4-6` — faster and cheaper; use for testing or high-volume runs where quality difference is acceptable
+- `claude-opus-4-6` — highest quality; best at script restoration and clinical term inference
+- `claude-sonnet-4-6` — faster and cheaper; default in the worker for high-volume throughput
 
 ---
 
 ## Running Locally
 
+### Worker (automatic)
+
+```bash
+cd worker
+
+# add to .env
+echo "ANTHROPIC_API_KEY=sk-ant-..." >> .env
+
+# run pipeline — normalisation runs automatically if key is set
+make run-local f=/path/to/audio.mp3
+
+# disable normalisation for a run
+POSTPROCESS_ENABLED=false make run-local f=/path/to/audio.mp3
+```
+
+The results JSON will contain `normalized_transcript` and `normalized_translation`
+on every segment, plus a top-level `postprocess` key with the model ID and any
+glossary corrections Claude made.
+
+### Standalone UI
+
 ```bash
 cd postprocess-ui
 
-# create .env
-echo "ANTHROPIC_API_KEY=your_key_here" > .env
-
-# install dependencies
+echo "ANTHROPIC_API_KEY=sk-ant-..." > .env
 uv sync
-
-# run
 uv run streamlit run app.py
 ```
 
-The app runs at `http://localhost:8501`. Upload a `results.json` from the ECS pipeline, optionally add a glossary in the sidebar, select a model, and click **Run post-processing**.
+The app runs at `http://localhost:8501`. Upload a `results.json` from the ECS pipeline, optionally type a custom glossary in the sidebar (one `wrong → right` or `term` per line), select a model, and click **Run post-processing**.
