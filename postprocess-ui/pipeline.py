@@ -207,6 +207,14 @@ def _parse_json_object(text: str) -> dict:
     raise ValueError("No JSON object found in model response")
 
 
+def _is_truncated(resp) -> bool:
+    """Return True if the API stopped because it hit the output token limit."""
+    meta = getattr(resp, "response_metadata", {}) or {}
+    # LangChain surfaces this as finish_reason (OpenAI-style) or stop_reason (Anthropic-style)
+    reason = meta.get("stop_reason") or meta.get("finish_reason") or ""
+    return str(reason).lower() == "max_tokens"
+
+
 def _invoke_cleaned_turns(llm, messages: list) -> CleanedTurns:
     """Structured output via Anthropic (json_schema, then tools), else raw JSON parse."""
 
@@ -225,6 +233,10 @@ def _invoke_cleaned_turns(llm, messages: list) -> CleanedTurns:
             logger.debug("Structured output (%s) failed; trying next path: %s", label, e)
 
     resp = llm.invoke(messages)
+
+    if _is_truncated(resp):
+        raise _OutputTruncatedError("Model hit max_tokens limit — output was truncated")
+
     text = _extract_message_text(resp.content)
     if not text or not text.strip():
         rc = getattr(resp, "additional_kwargs", {}) or {}
@@ -246,6 +258,10 @@ def _invoke_cleaned_turns(llm, messages: list) -> CleanedTurns:
         raise
 
     return CleanedTurns.model_validate(obj)
+
+
+class _OutputTruncatedError(Exception):
+    """Raised when the model hit max_tokens — signals the caller to split the batch."""
 
 
 def _align_to_batch(batch: list[SpeakerTurn], parsed: CleanedTurns) -> CleanedTurns:
@@ -281,7 +297,17 @@ def _fallback_identity(batch: list[SpeakerTurn]) -> CleanedTurns:
     )
 
 
-def clean_batch(llm, batch: list[SpeakerTurn], glossary: str) -> CleanedTurns:
+def clean_batch(llm, batch: list[SpeakerTurn], glossary: str, _depth: int = 0) -> CleanedTurns:
+    """Clean one batch of turns. Splits in half and recurses if output is truncated."""
+
+    # Hard stop: a single turn that still truncates is uncleanable — pass through.
+    if len(batch) == 1 and _depth > 0:
+        logger.warning(
+            "Single turn %s still truncates — passing through uncleaned",
+            batch[0].turn_index,
+        )
+        return _fallback_identity(batch)
+
     system = build_system_prompt(glossary)
     payload = [t.model_dump(mode="json") for t in batch]
     payload_json = json.dumps(payload, ensure_ascii=False)
@@ -312,6 +338,19 @@ def clean_batch(llm, batch: list[SpeakerTurn], glossary: str) -> CleanedTurns:
             parsed = _invoke_cleaned_turns(llm, messages)
             aligned = _align_to_batch(batch, parsed)
             return aligned
+        except _OutputTruncatedError:
+            # Output token limit hit — split the batch and recurse, don't retry.
+            mid = len(batch) // 2
+            logger.warning(
+                "Output truncated for batch of %d turns (depth=%d) — splitting at %d",
+                len(batch), _depth, mid,
+            )
+            left = clean_batch(llm, batch[:mid], glossary, _depth + 1)
+            right = clean_batch(llm, batch[mid:], glossary, _depth + 1)
+            merged_turns = left.turns + right.turns
+            merged_glossary: list[GlossaryCorrection] = list(left.glossary_corrections)
+            _merge_glossary(merged_glossary, right.glossary_corrections)
+            return CleanedTurns(turns=merged_turns, glossary_corrections=merged_glossary)
         except Exception as e:
             last_exc = e
             logger.warning("clean_batch attempt %s failed: %s", attempt + 1, e)
