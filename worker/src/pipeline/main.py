@@ -29,9 +29,14 @@ import structlog
 from .audio import convert_to_mono_wav, get_duration
 from .chunking import chunk_audio
 from .config import (
+    GLOSSARY_FILE_PATH,
+    POSTPROCESS_ENABLED,
+    POSTPROCESS_MODEL,
     TRANSLATION_FAILURE_THRESHOLD,
     TRANSLATION_MIN_SUBSTANTIAL_CHARS,
+    get_anthropic_api_key,
 )
+from .postprocess import run_postprocess
 from .events import publish_job_event
 from .merger import merge
 from .metrics import emit_job_outcome, emit_translation_coverage
@@ -239,7 +244,43 @@ def process_job(
                     f"({empty}/{nonempty_src} substantial segments empty)"
                 )
 
-            # ── 7. Assemble + persist results JSON to S3 ──────────────────
+            # ── 7. LLM normalisation (optional) ──────────────────────────
+            pp_normalized = None
+            pp_meta = None
+            if POSTPROCESS_ENABLED:
+                try:
+                    api_key = get_anthropic_api_key()
+                except Exception as e:
+                    log.warning("Could not retrieve Anthropic API key — skipping postprocess", error=str(e))
+                    api_key = ""
+                if api_key:
+                    log.info("status=postprocessing", model=POSTPROCESS_MODEL)
+                    try:
+                        pp_result = run_postprocess(
+                            merged,
+                            api_key=api_key,
+                            model=POSTPROCESS_MODEL,
+                            glossary_path=GLOSSARY_FILE_PATH,
+                        )
+                        pp_normalized = pp_result.normalized
+                        pp_meta = {
+                            "model": pp_result.model,
+                            "glossary_corrections": pp_result.glossary_corrections,
+                        }
+                        log.info(
+                            "Postprocessing complete",
+                            normalized_segments=len(pp_normalized),
+                            glossary_corrections=len(pp_result.glossary_corrections),
+                        )
+                    except Exception as e:
+                        log.warning(
+                            "Postprocessing failed — results will have empty normalized fields",
+                            error=str(e),
+                        )
+                else:
+                    log.info("ANTHROPIC_API_KEY not set — skipping postprocess")
+
+            # ── 8. Assemble + persist results JSON to S3 ──────────────────
             num_speakers = len(set(s.speaker_id for s in merged))
             completed_at = datetime.now(timezone.utc)
 
@@ -255,6 +296,8 @@ def process_job(
                 merged=merged,
                 started_at=started_at,
                 completed_at=completed_at,
+                normalized=pp_normalized,
+                postprocess_meta=pp_meta,
             )
             results_location = write_results(job_id, document)
 

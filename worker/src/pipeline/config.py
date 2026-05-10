@@ -71,6 +71,21 @@ SUPPORTED_EXTENSIONS: set[str] = {
 # .mp4 is handled separately — converted to .m4a before Sarvam upload
 
 
+# ── LLM post-processing ───────────────────────────────────────────────────────
+# Set POSTPROCESS_ENABLED=false to skip the normalisation step entirely.
+POSTPROCESS_ENABLED: bool = os.getenv("POSTPROCESS_ENABLED", "true").lower() == "true"
+POSTPROCESS_MODEL: str = os.getenv("POSTPROCESS_MODEL", "claude-sonnet-4-6")
+
+# Path to glossary JSON (see postprocess.py for format). Defaults to
+# glossary.json in the working directory (/app inside the container).
+GLOSSARY_FILE_PATH: str = os.getenv("GLOSSARY_FILE_PATH", "/app/glossary.json")
+
+# Direct env var for local dev; in production set ANTHROPIC_SECRET_NAME so
+# the key is fetched from Secrets Manager (not stored in task env vars).
+ANTHROPIC_API_KEY: str = os.getenv("ANTHROPIC_API_KEY", "")
+ANTHROPIC_SECRET_NAME: str = os.getenv("ANTHROPIC_SECRET_NAME", "anchor-voice/anthropic-api-key")
+
+
 def _get_secret(secret_name: str) -> str:
     """Fetch a plain-string secret from AWS Secrets Manager."""
     client = boto3.client("secretsmanager", region_name=AWS_REGION)
@@ -83,6 +98,14 @@ def _get_secret(secret_name: str) -> str:
 
 
 _sarvam_api_key: str | None = None
+_anthropic_api_key: str | None = None
+
+
+def get_anthropic_api_key() -> str:
+    global _anthropic_api_key
+    if _anthropic_api_key is None:
+        _anthropic_api_key = ANTHROPIC_API_KEY or _get_secret(ANTHROPIC_SECRET_NAME).strip()
+    return _anthropic_api_key
 
 
 def get_sarvam_api_key() -> str:

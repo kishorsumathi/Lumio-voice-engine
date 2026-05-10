@@ -75,6 +75,8 @@ def build_results_document(
     merged: list[MergedSegment],
     started_at: datetime,
     completed_at: datetime,
+    normalized: "dict[int, tuple[str, str]] | None" = None,
+    postprocess_meta: "dict | None" = None,
 ) -> dict:
     """
     Assemble the results JSON document (returned as a Python dict, not serialized).
@@ -92,6 +94,7 @@ def build_results_document(
     itself (`MergedSegment.translation`). Segments where the translate pass
     produced no overlapping output have `translation: ""`.
     """
+    norm = normalized or {}
     segments = [
         {
             "segment_index": s.segment_index,
@@ -101,6 +104,8 @@ def build_results_document(
             "end_time": round(s.end_time, 3),
             "transcription": s.text,
             "translation": s.translation,
+            "normalized_transcript": norm.get(s.segment_index, ("", ""))[0],
+            "normalized_translation": norm.get(s.segment_index, ("", ""))[1],
             "confidence": (
                 round(s.confidence, 3) if s.confidence is not None else None
             ),
@@ -132,6 +137,7 @@ def build_results_document(
             ),
         },
         "segments": segments,
+        "postprocess": postprocess_meta or None,
     }
 
 
