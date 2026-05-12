@@ -36,7 +36,7 @@ SARVAM_MAX_CONCURRENT_CHUNKS: int = int(os.getenv("SARVAM_MAX_CONCURRENT_CHUNKS"
 # drift between codemix and translate modes, or a wholly failed translate
 # pass on this audio).
 TRANSLATION_FAILURE_THRESHOLD: float = float(
-    os.getenv("TRANSLATION_FAILURE_THRESHOLD", "0.10")
+    os.getenv("TRANSLATION_FAILURE_THRESHOLD", "0.60")
 )
 
 # Minimum text length (characters, post-strip) for a transcription segment
@@ -44,7 +44,7 @@ TRANSLATION_FAILURE_THRESHOLD: float = float(
 # is treated as a backchannel/interjection that the translate pass is
 # allowed to omit without penalty.
 TRANSLATION_MIN_SUBSTANTIAL_CHARS: int = int(
-    os.getenv("TRANSLATION_MIN_SUBSTANTIAL_CHARS", "20")
+    os.getenv("TRANSLATION_MIN_SUBSTANTIAL_CHARS", "30")
 )
 
 # ── AWS ───────────────────────────────────────────────────────────────────────

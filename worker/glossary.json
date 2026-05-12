@@ -17,7 +17,9 @@
     {"heard": "que ty a peen",       "corrected": "quetiapine"},
     {"heard": "olan za peen",        "corrected": "olanzapine"},
     {"heard": "mir taza peen",       "corrected": "mirtazapine"},
-    {"heard": "pro pran o lol",      "corrected": "propranolol"}
+    {"heard": "pro pran o lol",      "corrected": "propranolol"},
+    {"heard": "Sukhum",              "corrected": "sukoon"},
+    {"heard": "sukhum",              "corrected": "sukoon"}
   ],
   "terms": [
     "sertraline",

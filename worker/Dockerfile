@@ -18,7 +18,12 @@ COPY src/ ./src/
 # UV_PROJECT_ENVIRONMENT forces uv sync to install into /opt/venv instead of
 # its default (a .venv adjacent to pyproject.toml), so the runtime stage can
 # COPY /opt/venv cleanly.
-ENV UV_PROJECT_ENVIRONMENT=/opt/venv
+# PyPI + PyTorch wheels are large; defaults (30s read, 3 retries) often fail
+# under Docker Desktop / flaky TLS ("unexpected_eof"). Tune for CI + laptops.
+ENV UV_PROJECT_ENVIRONMENT=/opt/venv \
+    UV_HTTP_TIMEOUT=600 \
+    UV_HTTP_RETRIES=10 \
+    UV_CONCURRENT_DOWNLOADS=4
 RUN uv venv /opt/venv && \
     uv sync --frozen --no-dev
 

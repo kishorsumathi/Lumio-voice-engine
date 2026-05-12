@@ -444,7 +444,7 @@ phase_ecs() {
       {"name": "SARVAM_SECRET_NAME",           "value": "${SARVAM_SECRET_NAME}"},
       {"name": "JOB_EVENTS_QUEUE_URL",         "value": "${EVENTS_QUEUE_URL}"},
       {"name": "SARVAM_RPM_LIMIT",             "value": "100"},
-      {"name": "TRANSLATION_FAILURE_THRESHOLD","value": "0.05"},
+      {"name": "TRANSLATION_FAILURE_THRESHOLD","value": "0.60"},
       {"name": "METRICS_NAMESPACE",            "value": "AnchorVoice"},
       {"name": "POSTPROCESS_ENABLED",          "value": "${POSTPROCESS_ENABLED}"},
       {"name": "POSTPROCESS_MODEL",            "value": "${POSTPROCESS_MODEL}"},
