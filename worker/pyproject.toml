@@ -28,6 +28,7 @@ dependencies = [
     "structlog>=24.1",
     # Environment
     "python-dotenv>=1.0",
+    "elevenlabs>=2.47.0",
 ]
 
 [project.scripts]

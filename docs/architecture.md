@@ -4,7 +4,7 @@
 
 **Lumio Voice** is the product name for this stack; the codebase and AWS resources use the **anchor-voice** naming convention. This document describes only the **processing pipeline and AWS data plane** (ingestion, worker, storage, events) — not client applications or consoles.
 
-Anchor Voice is an event-driven AWS pipeline that transcribes long-form audio (medical sessions) using Sarvam Saaras v3 with cross-chunk speaker diarization — entirely without an external diarization model.
+Anchor Voice is an event-driven AWS pipeline that transcribes long-form audio (medical sessions) using Sarvam Saaras v3 and ElevenLabs Scribe v2 with cross-chunk speaker diarization — entirely without an external diarization model.
 
 Target users: doctors, therapists, psychiatrists recording clinical sessions.
 
@@ -39,16 +39,13 @@ Target users: doctors, therapists, psychiatrists recording clinical sessions.
 │  │  Pipeline (main.py)                        │                 │
 │  │    1. Download from S3                     │                 │
 │  │    2. VAD chunking (silero-vad)            │                 │
-│  │    3. Parallel per chunk:                  │                 │
-│  │         3a. Saaras mode=codemix   ─────────┼─► Sarvam Saaras │
-│  │         3b. Saaras mode=translate ─────────┼─► Sarvam Saaras │
-│  │         (timestamp-overlap zip merges      │                 │
-│  │          translation onto transcription)   │                 │
-│  │    4. Overlap speaker stitching            │                 │
-│  │    5. LLM normalisation (optional) ────────┼─► Anthropic API │
-│  │         clinical terms, script restore,    │  (Claude Sonnet) │
-│  │         formatting, noise removal          │                 │
-│  │    6. Write results JSON ──────────────────┼─► S3 (results/) │
+│  │    3. Provider lanes in parallel:          │                 │
+│  │         Sarvam Saaras v3          ─────────┼─► Sarvam API    │
+│  │         ElevenLabs Scribe v2      ─────────┼─► ElevenLabs API│
+│  │    4. Per-provider speaker stitching       │                 │
+│  │    5. Claude per provider as soon as       ├─► Anthropic API │
+│  │       that provider's STT + merge is done  │  (Claude Sonnet) │
+│  │    6. Write provider outputs JSON ─────────┼─► S3 (results/) │
 │  │    7. Publish pointer event ───────────────┼─► SQS events    │
 │  └────────────────────────────────────────────┘                 │
 │                                                                 │
@@ -125,7 +122,23 @@ For long audio, **silero-vad** runs on **`{stem}_16k_mono.wav`**; Sarvam **`chun
 
 ---
 
-### Stage 3 — Parallel transcription + translation (dual Saaras pass)
+### Stage 3 — Provider-Parallel Transcription
+
+**File:** `main.py`
+
+After chunking, the worker starts independent provider lanes with `ThreadPoolExecutor(max_workers=2)`:
+
+```
+chunks
+  ├── Sarvam lane: Saaras codemix + translate → merge → Claude postprocess
+  └── Scribe lane: ElevenLabs Scribe v2       → merge → Claude postprocess
+```
+
+The lanes do not wait for each other between STT and Claude. If Sarvam finishes first, Sarvam's Claude postprocess begins while Scribe v2 may still be transcribing; if Scribe finishes first, Scribe's Claude postprocess begins while Sarvam may still be running. Claude concurrency is bounded by `POSTPROCESS_MAX_CONCURRENT_PROVIDERS` (default `2`). Anthropic rate limits are account/model/tier-specific and enforced across RPM, input-token-per-minute, and output-token-per-minute limits, so the default is intentionally one Claude slot per provider lane rather than an aggressive hardcoded value.
+
+Sarvam is required for job success. If Sarvam fails, the job fails. Scribe v2 is additive: if it fails while Sarvam succeeds, the results JSON includes `scribe_v2.status = "failed"` and still writes the Sarvam output.
+
+### Stage 3a — Sarvam transcription + translation (dual Saaras pass)
 
 **File:** `transcription.py`
 
@@ -174,11 +187,28 @@ Both Saaras jobs run on the same audio, so diarization boundaries usually agree 
 
 ---
 
-### Stage 4 — Cross-Chunk Speaker Stitching
+### Stage 3b — ElevenLabs Scribe v2 transcription
+
+**File:** `elevenlabs_transcription.py`
+
+When `ELEVENLABS_ENABLED=true`, the Scribe v2 lane sends each chunk to ElevenLabs Speech to Text with diarization, word timestamps, `no_verbatim=true`, and glossary-derived `keyterms` when enabled. `ELEVENLABS_NUM_SPEAKERS` is empty by default so Scribe v2 infers the speaker count.
+
+The adapter validates every chunk before upload:
+
+- `ELEVENLABS_MAX_UPLOAD_BYTES` defaults to `3000000000` bytes (3.0 GB).
+- `ELEVENLABS_MAX_DURATION_S` defaults to `36000` seconds (10 hours).
+- `ELEVENLABS_MAX_CONCURRENT_CHUNKS` defaults to `2` to avoid aggressive API fan-out.
+- 429 and 5xx failures retry with exponential backoff and respect `Retry-After` when the API provides it.
+
+Scribe v2 does not provide Sarvam-style English translate-mode output, so its raw segment `translation` fields are empty until Claude postprocess generates `normalized_translation`; the result writer can then expose that cleaned translation on the provider segment output.
+
+---
+
+### Stage 4 — Per-Provider Cross-Chunk Speaker Stitching
 
 **File:** `merger.py`
 
-Sarvam assigns speaker IDs independently per chunk — `SPEAKER_0` in chunk 1 and `SPEAKER_0` in chunk 2 may be different people. The merger makes speaker IDs globally consistent using the overlap region.
+STT providers assign speaker IDs independently per chunk — `SPEAKER_0` in chunk 1 and `SPEAKER_0` in chunk 2 may be different people. Each provider lane runs the merger on its own segment list so Sarvam and Scribe v2 get separate, internally consistent speaker IDs without mixing segments across providers.
 
 ```
 Overlap window: chunk[i].start_time → chunk[i].content_start
@@ -209,11 +239,11 @@ After stitching:
 
 ---
 
-### Stage 5 — LLM Normalisation (optional)
+### Stage 5 — Provider-Lane LLM Normalisation (optional)
 
 **File:** `postprocess.py`
 
-After Sarvam transcription and the translation coverage check, an optional Claude pass cleans every segment's transcription and translation. This step is skipped silently if `POSTPROCESS_ENABLED=false` or `ANTHROPIC_API_KEY` / `ANTHROPIC_SECRET_NAME` is absent — it never blocks job completion.
+After a provider finishes STT and `merge()`, an optional Claude pass cleans that provider's segment list immediately. This is chained inside each provider lane, so Sarvam and Scribe v2 can postprocess at the same time when `POSTPROCESS_MAX_CONCURRENT_PROVIDERS >= 2`. The step is skipped silently if `POSTPROCESS_ENABLED=false` or `ANTHROPIC_API_KEY` / `ANTHROPIC_SECRET_NAME` is absent — it never blocks job completion.
 
 **What it fixes:**
 
@@ -228,6 +258,8 @@ After Sarvam transcription and the translation coverage check, an optional Claud
 **Output fields added per segment:**
 - `normalized_transcript` — cleaned transcription, Indian-language text in native script
 - `normalized_translation` — cleaned fluent English translation
+
+For Scribe v2, Claude also restores romanized Indian-language text back to the native script when the base language is clear, and it produces the English translation because ElevenLabs STT does not supply Sarvam-style translate-mode output.
 
 **Glossary:** `worker/glossary.json` is bundled in the Docker image and read at runtime. Contains two arrays:
 - `corrections` — ASR mishearings with their correct form: `{"heard": "sir traline", "corrected": "sertraline"}`
@@ -263,7 +295,7 @@ A non-empty `text` with empty `translation` means the translate-mode Saaras pass
 1. The translate pass diverged enough from codemix on diarization boundaries that one transcription segment fell into a sub-second gap between translation segments. Fixable with proportional trimming if it ever becomes common.
 2. The translate pass returned an empty result for the entire chunk (Sarvam-side issue). The chunk-worker logs `translate pass returned 0 segments` at WARNING and the entire chunk's translations come back empty.
 
-If `fail_rate > TRANSLATION_FAILURE_THRESHOLD` (default **0.05**, env-overridable) the job is marked failed and the SQS message is left visible for redelivery / DLQ.
+If `fail_rate > TRANSLATION_FAILURE_THRESHOLD` (default **0.60**, env-overridable) the job is marked failed and the SQS message is left visible for redelivery / DLQ.
 
 #### Refinements (only enable if real-world coverage drops)
 
@@ -312,8 +344,6 @@ Why a claim-check over inlining in SQS:
   "summary": {
     "audio_duration_seconds": 3421.47,
     "num_chunks": 2,
-    "num_segments": 287,
-    "num_speakers": 2,
     "source_language": null
   },
 
@@ -323,27 +353,46 @@ Why a claim-check over inlining in SQS:
     "wall_clock_seconds": 1063.52
   },
 
-  "segments": [
-    {
-      "segment_index": 0,
-      "chunk_index": 0,
-      "speaker_id": 0,
-      "start_time": 0.000,
-      "end_time": 8.420,
-      "transcription":          "haan I I I feel like mood bahut low hai",
-      "translation":            "yes I feel like mood is very low",
-      "normalized_transcript":  "हाँ, I feel like mood बहुत low है।",
-      "normalized_translation": "Yes, I feel like my mood has been very low.",
-      "confidence": 0.942
+  "sarvam": {
+    "provider": "sarvam",
+    "model": "saaras:v3",
+    "status": "completed",
+    "summary": { "num_segments": 287, "num_speakers": 2 },
+    "segments": [
+      {
+        "segment_index": 0,
+        "chunk_index": 0,
+        "speaker_id": 0,
+        "start_time": 0.000,
+        "end_time": 8.420,
+        "transcription":          "haan I I I feel like mood bahut low hai",
+        "translation":            "yes I feel like mood is very low",
+        "normalized_transcript":  "हाँ, I feel like mood बहुत low है।",
+        "normalized_translation": "Yes, I feel like my mood has been very low.",
+        "confidence": 0.942
+      }
+      // … one entry per Sarvam merged speaker turn
+    ],
+    "postprocess": {
+      "model": "claude-sonnet-4-6",
+      "glossary_corrections": [
+        { "heard": "cat distributing", "corrected": "catastrophising" }
+      ]
     }
-    // … one entry per merged speaker turn
-  ],
-  // null when POSTPROCESS_ENABLED=false or ANTHROPIC_API_KEY absent
-  "postprocess": {
-    "model": "claude-sonnet-4-6",
-    "glossary_corrections": [
-      { "heard": "cat distributing", "corrected": "catastrophising" }
-    ]
+  },
+  "scribe_v2": {
+    "provider": "elevenlabs",
+    "model": "scribe_v2",
+    "status": "completed",
+    "summary": { "num_segments": 301, "num_speakers": 2 },
+    "segments": [
+      // same segment shape; translation/normalisation comes from Claude
+    ],
+    "postprocess": {
+      "model": "claude-sonnet-4-6",
+      "translation_source": "claude",
+      "script_restoration": true
+    }
   }
 }
 ```
@@ -399,9 +448,7 @@ retried publish is deduped by SQS automatically.
   },
   "summary": {
     "audio_duration_seconds": 3421.47,
-    "num_chunks": 2,
-    "num_segments": 287,
-    "num_speakers": 2
+    "num_chunks": 2
   },
   "completed_at": "2026-04-22T10:31:45+00:00"
 }
@@ -468,7 +515,7 @@ This is a sliding window (not a fixed 60s bucket), so the rate is smooth with no
 | Sarvam 429 rate limit (either Saaras pass) | Wait 60s explicitly, then retry via `@retry` |
 | Sarvam 5xx / network timeout | `@retry` exponential backoff (3 attempts, 10s–60s) |
 | Chunk codemix-pass failure (after retries) | Raises immediately — job emits `job.failed` event, no results file written |
-| Chunk translate-pass returns 0 segments | Logged at WARNING; chunk's transcription is preserved with empty `translation` per segment; the global coverage check at Stage 5 may still fail the job if too many chunks are affected |
+| Chunk translate-pass returns 0 segments | Logged at WARNING; chunk's transcription is preserved with empty `translation` per segment; the global coverage check may still fail the job if too many chunks are affected |
 | Translation coverage below threshold | Job fails with `Translation failure rate X% for en-IN exceeds threshold Y%` and message redelivers (default `TRANSLATION_FAILURE_THRESHOLD=0.05`) |
 | pyannote / diarization | Removed — not used. Sarvam provides per-chunk diarization in both modes |
 | Audio over 60 min | VAD chunking with overlap — no size limit |
@@ -483,14 +530,15 @@ This is a sliding window (not a fixed 60s bucket), so the rate is smooth with no
 ## Job Status State Machine
 
 ```
-pending → downloading → chunking → transcribing → merging → [normalising] → completed
-                                          (codemix + translate    (optional,      ↓ (any stage)
-                                           Saaras passes run in   skipped if         failed
-                                           parallel inside        no API key)
-                                           this stage)
+pending → downloading → chunking → provider lanes → completed
+                                  │
+                                  ├─ Sarvam: codemix + translate → merge → [normalising]
+                                  └─ Scribe: Scribe v2           → merge → [normalising]
+                                                               ↓ (any required stage)
+                                                               failed
 ```
 
-`normalising` is skipped silently if `POSTPROCESS_ENABLED=false` or the Anthropic API key is absent. A normalisation failure is logged as a warning and the job continues to `completed` with empty `normalized_transcript` / `normalized_translation` fields.
+`normalising` is skipped silently if `POSTPROCESS_ENABLED=false` or the Anthropic API key is absent. A normalisation failure is logged as a warning and that provider continues to `completed` with empty `normalized_transcript` / `normalized_translation` fields. Scribe v2 failure does not fail the job if Sarvam succeeds; Sarvam failure still fails the job.
 
 These states are emitted as **structured log lines** only — there is no
 database row tracking them. `completed` corresponds to a results JSON in S3
@@ -518,16 +566,32 @@ Most options are environment variables:
 | `S3_PROCESSED_BUCKET` | — | Bucket the worker PUTs the results JSON to. **Required** — the worker exits if unset. |
 | `S3_RESULTS_PREFIX` | `results/` | Key prefix inside the bucket. Each completed job writes `<prefix><job_id>.json`. |
 | `JOB_EVENTS_QUEUE_URL` | — | SQS queue for `job.completed` / `job.failed` events. Unset = no publish. Supports `.fifo` suffix. |
-| `TRANSLATION_FAILURE_THRESHOLD` | 0.05 | Max fraction of segments where the translate-mode pass produced no overlapping output before the job is failed. |
+| `TRANSLATION_FAILURE_THRESHOLD` | 0.60 | Max fraction of substantial segments where the translate-mode pass produced no overlapping output before the job is failed. |
 | `SQS_HEARTBEAT_INTERVAL_S` | 300 | How often the worker extends the input SQS message visibility. |
 | `SQS_HEARTBEAT_EXTEND_BY_S` | 3600 | How long to extend each heartbeat. |
 | `METRICS_NAMESPACE` | `AnchorVoice` | CloudWatch namespace the worker emits EMF metrics under. |
 | `METRICS_ENABLED` | `1` | Set to `0` / `false` to silence EMF emissions (useful in local dev). |
 | `POSTPROCESS_ENABLED` | `true` | Set to `false` to skip the LLM normalisation step entirely. Pipeline completes normally with empty `normalized_transcript` / `normalized_translation`. |
 | `POSTPROCESS_MODEL` | `claude-sonnet-4-6` | Anthropic model for the normalisation pass. `claude-opus-4-6` for higher quality. |
+| `POSTPROCESS_MAX_CONCURRENT_PROVIDERS` | `2` | Maximum provider lanes allowed to call Claude at the same time. Default `2` lets Sarvam and Scribe v2 postprocess concurrently while respecting that Anthropic RPM/ITPM/OTPM limits are account and model tier specific. |
 | `ANTHROPIC_API_KEY` | — | Direct API key (local dev). In production use `ANTHROPIC_SECRET_NAME` instead. |
 | `ANTHROPIC_SECRET_NAME` | `anchor-voice/anthropic-api-key` | Secrets Manager secret name for the Anthropic key. |
 | `GLOSSARY_FILE_PATH` | `/app/glossary.json` | Path to the clinical glossary JSON file. Bundled in the image; override to mount a custom file. |
+| `AUDIO_PREPROCESSING_MODE` | `standard` | `standard` for plain 16 kHz mono WAV conversion, or `speech_enhanced` for high/low-pass filtering, speech EQ, dynamic normalisation, and limiting. |
+| `AUDIO_SLOW_DOWN` | `false` | When `speech_enhanced`, optionally applies `atempo=0.94` for batch transcription. |
+| `ELEVENLABS_ENABLED` | `true` | Enables a separate top-level `scribe_v2` provider output. Sarvam and Scribe v2 start in parallel after chunking, and each provider starts Claude postprocess as soon as its own STT + merge completes. |
+| `ELEVENLABS_MODEL_ID` | `scribe_v2` | ElevenLabs Speech to Text model ID. |
+| `ELEVENLABS_API_KEY` | — | Direct API key (local dev). In production use `ELEVENLABS_SECRET_NAME` instead. |
+| `ELEVENLABS_SECRET_NAME` | `anchor-voice/elevenlabs-api-key` | Secrets Manager secret name for the ElevenLabs key. |
+| `ELEVENLABS_MAX_CONCURRENT_CHUNKS` | `2` | Maximum Scribe v2 chunk requests in flight. Keep conservative; retry handles `429` / `5xx`. |
+| `ELEVENLABS_LANGUAGE_CODE` | — | Optional ISO language code; empty means Scribe detects language. |
+| `ELEVENLABS_NO_VERBATIM` | `true` | Removes filler words, false starts, and non-speech sounds before Claude postprocess. |
+| `ELEVENLABS_NUM_SPEAKERS` | — | Optional speaker-count hint. Empty by default so Scribe v2 infers speakers up to its supported maximum. |
+| `ELEVENLABS_TEMPERATURE` | `0.0` | Keeps Scribe output deterministic and accuracy-oriented. |
+| `ELEVENLABS_REQUEST_TIMEOUT_S` | `1800` | Synchronous Scribe v2 request timeout in seconds. |
+| `ELEVENLABS_KEYTERMS_FROM_GLOSSARY` | `true` | Sends glossary terms/correction targets as Scribe v2 keyterms, within ElevenLabs documented limits. |
+| `ELEVENLABS_MAX_UPLOAD_BYTES` | `3000000000` | Per-request Scribe v2 upload guard. Chunks above this fail Scribe output with a clear error. |
+| `ELEVENLABS_MAX_DURATION_S` | `36000` | Per-request Scribe v2 duration guard (10 hours). Chunks above this fail Scribe output with a clear error. |
 
 Target-language configuration is no longer settable — translation is always English, produced by Sarvam Saaras `mode=translate` running in parallel with the codemix transcription pass. The previous `DEFAULT_TARGET_LANGUAGES` env var (and the per-upload `Target-Languages` S3 metadata override) are removed.
 
@@ -707,9 +771,10 @@ aws logs tail /ecs/${NS}-worker --region ${AWS_REGION} --follow
 
 ## Data Privacy (Medical Use)
 
-- Audio never leaves Sarvam's API and your AWS infrastructure
+- Audio is sent to Sarvam. When `ELEVENLABS_ENABLED=true`, audio chunks are also sent to ElevenLabs Scribe v2.
 - **Transcript text is sent to the Anthropic API** during the LLM normalisation step. Disable with `POSTPROCESS_ENABLED=false` if patient data must not leave AWS. Anthropic's API processes only text (no audio). Review Anthropic's data processing agreement and HIPAA eligibility before production medical use.
 - Speaker stitching uses only text similarity (rapidfuzz) — no embeddings or external model
 - S3 buckets are private with `BlockPublicAcls=true` and SSE-S3 encryption at rest; results JSONs are written with `ServerSideEncryption: AES256`
 - All AWS services used are HIPAA-eligible (requires BAA with AWS)
 - Sarvam data processing agreement required before production medical use
+- ElevenLabs data processing agreement / BAA review required before production medical use when Scribe v2 is enabled.

@@ -21,8 +21,10 @@ import logging
 import shutil
 import sys
 import tempfile
+import threading
 import traceback
 import uuid
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -39,10 +41,23 @@ logging.basicConfig(
     datefmt="%H:%M:%S",
 )
 
-from pipeline.audio import convert_to_mono_wav, get_duration  # noqa: E402
+from pipeline.audio import convert_to_mono_wav, convert_to_speech_enhanced_wav, get_duration  # noqa: E402
 from pipeline.chunking import chunk_audio  # noqa: E402
+from pipeline.config import (  # noqa: E402
+    AUDIO_PREPROCESSING_MODE,
+    AUDIO_SLOW_DOWN,
+    ELEVENLABS_ENABLED,
+    ELEVENLABS_MODEL_ID,
+    GLOSSARY_FILE_PATH,
+    POSTPROCESS_ENABLED,
+    POSTPROCESS_MAX_CONCURRENT_PROVIDERS,
+    POSTPROCESS_MODEL,
+    get_anthropic_api_key,
+)
+from pipeline.elevenlabs_transcription import transcribe_all_chunks_elevenlabs  # noqa: E402
 from pipeline.merger import merge  # noqa: E402
-from pipeline.results_writer import build_results_document  # noqa: E402
+from pipeline.postprocess import run_postprocess  # noqa: E402
+from pipeline.results_writer import build_provider_output, build_results_document  # noqa: E402
 from pipeline.s3 import _MP4_REMAP  # noqa: E402
 from pipeline.transcription import transcribe_all_chunks  # noqa: E402
 
@@ -71,6 +86,59 @@ def write_transcript_txt(audio_path: Path, merged, output_path: Path) -> None:
     print(f"\nTranscript saved → {output_path}")
 
 
+def _normalize_audio(audio_path: Path, work_dir: Path) -> Path:
+    if AUDIO_PREPROCESSING_MODE == "speech_enhanced":
+        return convert_to_speech_enhanced_wav(
+            audio_path,
+            work_dir,
+            slow_down=AUDIO_SLOW_DOWN,
+        )
+    if AUDIO_PREPROCESSING_MODE != "standard":
+        raise RuntimeError(
+            "AUDIO_PREPROCESSING_MODE must be 'standard' or 'speech_enhanced'"
+        )
+    return convert_to_mono_wav(audio_path, work_dir)
+
+
+def _postprocess_provider(name: str, merged, api_key: str):
+    if not POSTPROCESS_ENABLED:
+        return {}, None
+    result = run_postprocess(
+        merged,
+        api_key=api_key,
+        model=POSTPROCESS_MODEL,
+        glossary_path=GLOSSARY_FILE_PATH,
+        source_provider="scribe_v2" if name == "scribe_v2" else "sarvam",
+    )
+    return result.normalized, {
+        "model": result.model,
+        "glossary_corrections": result.glossary_corrections,
+        "translation_source": "claude" if name == "scribe_v2" else "provider_then_claude",
+        "script_restoration": name == "scribe_v2",
+    }
+
+
+def _run_provider_lane(name: str, chunks, api_key: str, gate: threading.Semaphore):
+    if name == "sarvam":
+        transcript_segs = transcribe_all_chunks(chunks)
+    elif name == "scribe_v2":
+        transcript_segs = transcribe_all_chunks_elevenlabs(chunks)
+    else:
+        raise ValueError(f"Unknown provider: {name}")
+
+    merged = merge(chunks, transcript_segs)
+    normalized, meta = ({}, None)
+    if POSTPROCESS_ENABLED and api_key:
+        with gate:
+            normalized, meta = _postprocess_provider(name, merged, api_key)
+    return {
+        "merged": merged,
+        "normalized": normalized,
+        "meta": meta,
+        "transcript_segments": len(transcript_segs),
+    }
+
+
 def run(audio_path: Path) -> None:
     print(f"\n{'='*60}")
     print(f"  Anchor-Voice Local Pipeline Runner")
@@ -94,10 +162,9 @@ def run(audio_path: Path) -> None:
                 local_audio = renamed
 
             # Normalize to 16 kHz mono PCM WAV up-front — same contract as
-            # the production worker (guarantees a readable RIFF duration
-            # header even for browser MediaRecorder WebM, handles video
-            # containers via `-vn`, standardizes the rest of the pipeline).
-            local_audio = convert_to_mono_wav(local_audio, work_dir)
+            # the production worker. Optional speech enhancement is controlled
+            # by AUDIO_PREPROCESSING_MODE.
+            local_audio = _normalize_audio(local_audio, work_dir)
             duration = get_duration(local_audio)
             if duration <= 0:
                 raise RuntimeError(
@@ -111,11 +178,57 @@ def run(audio_path: Path) -> None:
                 print(f"  [{c.index}] {c.start_time:.1f}s–{c.end_time:.1f}s "
                       f"({c.duration/60:.1f}min) [{c.split_reason}]")
 
-            print("\nTranscribing + translating chunks (parallel Saaras passes)...")
-            transcript_segs = transcribe_all_chunks(chunks)
-            print(f"Transcript segments: {len(transcript_segs)}")
+            print("\nRunning provider transcription...")
+            providers = {}
+            provider_errors = {}
+            anthropic_api_key = ""
+            if POSTPROCESS_ENABLED:
+                anthropic_api_key = get_anthropic_api_key()
+                if anthropic_api_key:
+                    print(
+                        "Claude postprocess enabled "
+                        f"(max provider concurrency={POSTPROCESS_MAX_CONCURRENT_PROVIDERS})"
+                    )
+            postprocess_gate = threading.Semaphore(
+                max(1, POSTPROCESS_MAX_CONCURRENT_PROVIDERS)
+            )
+            with ThreadPoolExecutor(max_workers=2) as executor:
+                future_to_provider = {
+                    executor.submit(
+                        _run_provider_lane,
+                        "sarvam",
+                        chunks,
+                        anthropic_api_key,
+                        postprocess_gate,
+                    ): "sarvam",
+                }
+                if ELEVENLABS_ENABLED:
+                    future_to_provider[
+                        executor.submit(
+                            _run_provider_lane,
+                            "scribe_v2",
+                            chunks,
+                            anthropic_api_key,
+                            postprocess_gate,
+                        )
+                    ] = "scribe_v2"
+                for future in as_completed(future_to_provider):
+                    name = future_to_provider[future]
+                    try:
+                        providers[name] = future.result()
+                        print(
+                            f"{name} transcript segments: "
+                            f"{providers[name]['transcript_segments']}"
+                        )
+                        if providers[name]["meta"]:
+                            print(f"{name} postprocessed: {len(providers[name]['normalized'])} segments")
+                    except Exception as e:
+                        provider_errors[name] = str(e)
+                        print(f"{name} failed: {e}")
+                        if name == "sarvam":
+                            raise
 
-            merged = merge(chunks, transcript_segs)
+            merged = providers["sarvam"]["merged"]
             print(f"\nMerged segments: {len(merged)}")
             non_empty_translation = sum(1 for s in merged if s.translation)
             print(f"Translation coverage: {non_empty_translation}/{len(merged)} segments")
@@ -130,6 +243,35 @@ def run(audio_path: Path) -> None:
             num_speakers = len(set(s.speaker_id for s in merged))
             completed_at = datetime.now(timezone.utc)
 
+            provider_outputs = {
+                "sarvam": build_provider_output(
+                    provider="sarvam",
+                    model="saaras:v3",
+                    merged=providers["sarvam"]["merged"],
+                    normalized=providers["sarvam"].get("normalized"),
+                    postprocess_meta=providers["sarvam"].get("meta"),
+                    metadata={"preprocessing_mode": AUDIO_PREPROCESSING_MODE},
+                )
+            }
+            if ELEVENLABS_ENABLED and "scribe_v2" in providers:
+                provider_outputs["scribe_v2"] = build_provider_output(
+                    provider="elevenlabs",
+                    model=ELEVENLABS_MODEL_ID,
+                    merged=providers["scribe_v2"]["merged"],
+                    normalized=providers["scribe_v2"].get("normalized"),
+                    postprocess_meta=providers["scribe_v2"].get("meta"),
+                    metadata={"preprocessing_mode": AUDIO_PREPROCESSING_MODE},
+                    fill_translation_from_normalized=True,
+                )
+            elif ELEVENLABS_ENABLED:
+                provider_outputs["scribe_v2"] = build_provider_output(
+                    provider="elevenlabs",
+                    model=ELEVENLABS_MODEL_ID,
+                    status="failed",
+                    error=provider_errors.get("scribe_v2", "unknown error"),
+                    metadata={"preprocessing_mode": AUDIO_PREPROCESSING_MODE},
+                )
+
             document = build_results_document(
                 job_id=job_id,
                 source_bucket="local",
@@ -137,11 +279,10 @@ def run(audio_path: Path) -> None:
                 original_filename=audio_path.name,
                 audio_duration_seconds=duration,
                 num_chunks=len(chunks),
-                num_speakers=num_speakers,
                 source_language=None,
-                merged=merged,
                 started_at=started_at,
                 completed_at=completed_at,
+                provider_outputs=provider_outputs,
             )
 
             json_path = audio_path.parent / f"{audio_path.stem}_results.json"

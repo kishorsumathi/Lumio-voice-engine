@@ -245,7 +245,7 @@ Then emit JSON only.
 """
 
 
-def _build_system_prompt(glossary_text: str) -> str:
+def _build_system_prompt(glossary_text: str, *, source_provider: str = "sarvam") -> str:
     gloss = (glossary_text or "").strip()
     if not gloss:
         glossary_xml = (
@@ -261,7 +261,37 @@ def _build_system_prompt(glossary_text: str) -> str:
             f"{gloss}\n"
             "</glossary>"
         )
-    return _SYSTEM_PROMPT + "\n" + glossary_xml
+
+    provider_note = ""
+    if source_provider == "scribe_v2":
+        provider_note = """
+
+<provider_note>
+The source transcription came from ElevenLabs Scribe v2. It may transcribe
+Indian-language speech in Latin letters instead of the language's native script.
+For cleaned_transcription, restore romanised Indian-language words to the
+correct native script whenever context makes the base language clear. This is
+especially important for Hindi, Tamil, Kannada, Telugu, Malayalam, Marathi,
+Bengali, Gujarati, Punjabi, Urdu, and Odia. Preserve genuine English words and
+Latin-script proper nouns.
+
+The input translation field may be empty for this provider. When translation is
+empty but transcription is not empty, produce a faithful English translation in
+cleaned_translation instead of returning an empty string.
+</provider_note>
+"""
+    else:
+        provider_note = """
+
+<provider_note>
+The source transcription came from Sarvam Saaras and usually includes a
+pre-existing English translation. If an input translation is empty but the
+transcription is not empty, produce a faithful English translation in
+cleaned_translation instead of returning an empty string.
+</provider_note>
+"""
+
+    return _SYSTEM_PROMPT + provider_note + "\n" + glossary_xml
 
 
 def _build_user_message(payload_json: str, expected_indices: list[int]) -> str:
@@ -491,6 +521,7 @@ def run_postprocess(
     api_key: str,
     model: str,
     glossary_path: str,
+    source_provider: str = "sarvam",
 ) -> PostprocessOutput:
     """
     Run LLM normalisation over all merged segments.
@@ -501,7 +532,7 @@ def run_postprocess(
       model: the model ID used
     """
     glossary_text = load_glossary(glossary_path)
-    system = _build_system_prompt(glossary_text)
+    system = _build_system_prompt(glossary_text, source_provider=source_provider)
 
     llm = ChatAnthropic(
         model=model,

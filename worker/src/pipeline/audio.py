@@ -151,6 +151,56 @@ def convert_to_mono_wav(
     return out_path
 
 
+def convert_to_speech_enhanced_wav(
+    file_path: Path,
+    dest_dir: Path,
+    *,
+    slow_down: bool = False,
+    output_path: Path | None = None,
+) -> Path:
+    """
+    Convert audio to the same 16 kHz mono PCM WAV contract as
+    `convert_to_mono_wav`, with light speech-focused cleanup.
+
+    This is intended for batch transcription, not realtime audio: high/low pass
+    filtering removes rumble and ultrasonic noise, EQ boosts consonant clarity,
+    dynamic normalisation evens volume, and a limiter prevents clipping.
+    """
+    out_path = output_path or (dest_dir / (file_path.stem + "_speech_16k_mono.wav"))
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+
+    filters = [
+        "highpass=f=100",
+        "lowpass=f=7600",
+        "equalizer=f=2500:t=q:w=1.2:g=4",
+        "equalizer=f=4000:t=q:w=1.2:g=4",
+        "equalizer=f=6000:t=q:w=1.2:g=2",
+        "dynaudnorm=f=100:g=18:p=0.95",
+        "alimiter=limit=0.95",
+    ]
+    if slow_down:
+        filters.insert(0, "atempo=0.94")
+
+    logger.info(
+        "Converting to speech-enhanced 16kHz mono WAV: %s → %s",
+        file_path.name,
+        out_path.name,
+    )
+    subprocess.run(
+        [
+            "ffmpeg", "-y", "-i", str(file_path),
+            "-vn",
+            "-ac", "1",
+            "-ar", "16000",
+            "-sample_fmt", "s16",
+            "-af", ",".join(filters),
+            str(out_path),
+        ],
+        check=True, capture_output=True, timeout=_FFMPEG_TIMEOUT_S,
+    )
+    return out_path
+
+
 def split_audio_segment(
     source_path: Path,
     dest_path: Path,

@@ -47,6 +47,12 @@ TRANSLATION_MIN_SUBSTANTIAL_CHARS: int = int(
     os.getenv("TRANSLATION_MIN_SUBSTANTIAL_CHARS", "30")
 )
 
+# ── Audio preprocessing ───────────────────────────────────────────────────────
+# `standard` keeps the existing 16 kHz mono PCM WAV conversion. `speech_enhanced`
+# applies light filtering/EQ/dynamic normalisation before transcription.
+AUDIO_PREPROCESSING_MODE: str = os.getenv("AUDIO_PREPROCESSING_MODE", "standard").lower()
+AUDIO_SLOW_DOWN: bool = os.getenv("AUDIO_SLOW_DOWN", "false").lower() == "true"
+
 # ── AWS ───────────────────────────────────────────────────────────────────────
 AWS_REGION: str = os.getenv("AWS_REGION", "ap-south-1")
 
@@ -75,6 +81,10 @@ SUPPORTED_EXTENSIONS: set[str] = {
 # Set POSTPROCESS_ENABLED=false to skip the normalisation step entirely.
 POSTPROCESS_ENABLED: bool = os.getenv("POSTPROCESS_ENABLED", "true").lower() == "true"
 POSTPROCESS_MODEL: str = os.getenv("POSTPROCESS_MODEL", "claude-sonnet-4-6")
+POSTPROCESS_MAX_CONCURRENT_PROVIDERS: int = max(
+    1,
+    int(os.getenv("POSTPROCESS_MAX_CONCURRENT_PROVIDERS", "2")),
+)
 
 # Path to glossary JSON (see postprocess.py for format). Defaults to
 # glossary.json in the working directory (/app inside the container).
@@ -84,6 +94,36 @@ GLOSSARY_FILE_PATH: str = os.getenv("GLOSSARY_FILE_PATH", "/app/glossary.json")
 # the key is fetched from Secrets Manager (not stored in task env vars).
 ANTHROPIC_API_KEY: str = os.getenv("ANTHROPIC_API_KEY", "")
 ANTHROPIC_SECRET_NAME: str = os.getenv("ANTHROPIC_SECRET_NAME", "anchor-voice/anthropic-api-key")
+
+# ── ElevenLabs Scribe v2 ──────────────────────────────────────────────────────
+ELEVENLABS_ENABLED: bool = os.getenv("ELEVENLABS_ENABLED", "true").lower() == "true"
+ELEVENLABS_MODEL_ID: str = os.getenv("ELEVENLABS_MODEL_ID", "scribe_v2")
+ELEVENLABS_API_KEY: str = os.getenv("ELEVENLABS_API_KEY", "")
+ELEVENLABS_SECRET_NAME: str = os.getenv("ELEVENLABS_SECRET_NAME", "anchor-voice/elevenlabs-api-key")
+ELEVENLABS_MAX_CONCURRENT_CHUNKS: int = max(
+    1,
+    int(os.getenv("ELEVENLABS_MAX_CONCURRENT_CHUNKS", "2")),
+)
+ELEVENLABS_LANGUAGE_CODE: str = os.getenv("ELEVENLABS_LANGUAGE_CODE", "")
+# Scribe v2: no_verbatim=True removes filler words, false starts, and
+# non-speech sounds. This is the desired product default.
+ELEVENLABS_NO_VERBATIM: bool = os.getenv("ELEVENLABS_NO_VERBATIM", "true").lower() == "true"
+ELEVENLABS_NUM_SPEAKERS: int | None = (
+    int(os.getenv("ELEVENLABS_NUM_SPEAKERS", ""))
+    if os.getenv("ELEVENLABS_NUM_SPEAKERS", "").strip()
+    else None
+)
+ELEVENLABS_TEMPERATURE: float = float(os.getenv("ELEVENLABS_TEMPERATURE", "0.0"))
+ELEVENLABS_REQUEST_TIMEOUT_S: int = int(os.getenv("ELEVENLABS_REQUEST_TIMEOUT_S", "1800"))
+ELEVENLABS_KEYTERMS_FROM_GLOSSARY: bool = (
+    os.getenv("ELEVENLABS_KEYTERMS_FROM_GLOSSARY", "true").lower() == "true"
+)
+ELEVENLABS_MAX_UPLOAD_BYTES: int = int(
+    os.getenv("ELEVENLABS_MAX_UPLOAD_BYTES", str(3_000_000_000))
+)
+ELEVENLABS_MAX_DURATION_S: float = float(
+    os.getenv("ELEVENLABS_MAX_DURATION_S", str(10 * 60 * 60))
+)
 
 
 def _get_secret(secret_name: str) -> str:
@@ -99,6 +139,7 @@ def _get_secret(secret_name: str) -> str:
 
 _sarvam_api_key: str | None = None
 _anthropic_api_key: str | None = None
+_elevenlabs_api_key: str | None = None
 
 
 def get_anthropic_api_key() -> str:
@@ -106,6 +147,13 @@ def get_anthropic_api_key() -> str:
     if _anthropic_api_key is None:
         _anthropic_api_key = ANTHROPIC_API_KEY or _get_secret(ANTHROPIC_SECRET_NAME).strip()
     return _anthropic_api_key
+
+
+def get_elevenlabs_api_key() -> str:
+    global _elevenlabs_api_key
+    if _elevenlabs_api_key is None:
+        _elevenlabs_api_key = ELEVENLABS_API_KEY or _get_secret(ELEVENLABS_SECRET_NAME).strip()
+    return _elevenlabs_api_key
 
 
 def get_sarvam_api_key() -> str:

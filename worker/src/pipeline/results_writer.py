@@ -62,6 +62,71 @@ class ResultsLocation:
     etag: str
 
 
+def build_segments(
+    merged: list[MergedSegment],
+    normalized: "dict[int, tuple[str, str]] | None" = None,
+    *,
+    fill_translation_from_normalized: bool = False,
+) -> list[dict]:
+    norm = normalized or {}
+    segments = []
+    for s in merged:
+        normalized_transcript, normalized_translation = norm.get(s.segment_index, ("", ""))
+        translation = s.translation
+        if fill_translation_from_normalized and normalized_translation:
+            translation = normalized_translation
+        segments.append({
+            "segment_index": s.segment_index,
+            "chunk_index": s.chunk_index,
+            "speaker_id": s.speaker_id,
+            "start_time": round(s.start_time, 3),
+            "end_time": round(s.end_time, 3),
+            "transcription": s.text,
+            "translation": translation,
+            "normalized_transcript": normalized_transcript,
+            "normalized_translation": normalized_translation,
+            "confidence": (
+                round(s.confidence, 3) if s.confidence is not None else None
+            ),
+        })
+    return segments
+
+
+def build_provider_output(
+    *,
+    provider: str,
+    model: str,
+    merged: list[MergedSegment] | None = None,
+    normalized: "dict[int, tuple[str, str]] | None" = None,
+    postprocess_meta: "dict | None" = None,
+    status: str = "completed",
+    error: str | None = None,
+    metadata: "dict | None" = None,
+    fill_translation_from_normalized: bool = False,
+) -> dict:
+    provider_segments = merged or []
+    segments = build_segments(
+        provider_segments,
+        normalized,
+        fill_translation_from_normalized=fill_translation_from_normalized,
+    )
+    output = {
+        "provider": provider,
+        "model": model,
+        "status": status,
+        "summary": {
+            "num_segments": len(provider_segments),
+            "num_speakers": len({s.speaker_id for s in provider_segments}),
+        },
+        "segments": segments,
+        "postprocess": postprocess_meta or None,
+        "metadata": metadata or {},
+    }
+    if error:
+        output["error"] = error
+    return output
+
+
 def build_results_document(
     *,
     job_id: uuid.UUID,
@@ -70,13 +135,10 @@ def build_results_document(
     original_filename: str | None,
     audio_duration_seconds: float,
     num_chunks: int,
-    num_speakers: int,
     source_language: str | None,
-    merged: list[MergedSegment],
     started_at: datetime,
     completed_at: datetime,
-    normalized: "dict[int, tuple[str, str]] | None" = None,
-    postprocess_meta: "dict | None" = None,
+    provider_outputs: "dict[str, dict] | None" = None,
 ) -> dict:
     """
     Assemble the results JSON document (returned as a Python dict, not serialized).
@@ -84,36 +146,12 @@ def build_results_document(
     Schema (v1):
       schema_version, job_id, status
       source { bucket, key, original_filename }
-      summary { audio_duration_seconds, num_chunks, num_segments, num_speakers, source_language }
+      summary { audio_duration_seconds, num_chunks, source_language }
       timing { started_at, completed_at, wall_clock_seconds }
-      segments[]: { segment_index, chunk_index, speaker_id, start_time, end_time,
-                    transcription, translation, confidence }
-
-    Translation is always English. It is produced by a parallel Saaras
-    `mode=translate` pass during transcription and carried on the segment
-    itself (`MergedSegment.translation`). Segments where the translate pass
-    produced no overlapping output have `translation: ""`.
+      sarvam / scribe_v2 provider outputs, each with provider-specific summary
+      and segments.
     """
-    norm = normalized or {}
-    segments = [
-        {
-            "segment_index": s.segment_index,
-            "chunk_index": s.chunk_index,
-            "speaker_id": s.speaker_id,
-            "start_time": round(s.start_time, 3),
-            "end_time": round(s.end_time, 3),
-            "transcription": s.text,
-            "translation": s.translation,
-            "normalized_transcript": norm.get(s.segment_index, ("", ""))[0],
-            "normalized_translation": norm.get(s.segment_index, ("", ""))[1],
-            "confidence": (
-                round(s.confidence, 3) if s.confidence is not None else None
-            ),
-        }
-        for s in merged
-    ]
-
-    return {
+    document = {
         "schema_version": SCHEMA_VERSION,
         "job_id": str(job_id),
         "status": "completed",
@@ -125,8 +163,6 @@ def build_results_document(
         "summary": {
             "audio_duration_seconds": round(audio_duration_seconds, 2),
             "num_chunks": num_chunks,
-            "num_segments": len(merged),
-            "num_speakers": num_speakers,
             "source_language": source_language,
         },
         "timing": {
@@ -136,9 +172,12 @@ def build_results_document(
                 (completed_at - started_at).total_seconds(), 2
             ),
         },
-        "segments": segments,
-        "postprocess": postprocess_meta or None,
     }
+
+    if provider_outputs:
+        document.update(provider_outputs)
+
+    return document
 
 
 def write_results(job_id: uuid.UUID, document: dict) -> ResultsLocation:
@@ -168,14 +207,15 @@ def write_results(job_id: uuid.UUID, document: dict) -> ResultsLocation:
     # they aren't populated.
     source = document.get("source") or {}
     summary = document.get("summary") or {}
+    sarvam_summary = (document.get("sarvam") or {}).get("summary") or {}
     metadata: dict[str, str] = {
         "job-id": str(job_id),
         "source-bucket": str(source.get("bucket") or "")[:256],
         "source-key": str(source.get("key") or "")[:1024],
         "original-filename": str(source.get("original_filename") or "")[:256],
         "audio-duration-seconds": f"{summary.get('audio_duration_seconds', 0):.2f}",
-        "num-segments": str(summary.get("num_segments") or 0),
-        "num-speakers": str(summary.get("num_speakers") or 0),
+        "num-segments": str(sarvam_summary.get("num_segments") or 0),
+        "num-speakers": str(sarvam_summary.get("num_speakers") or 0),
         "schema-version": str(document.get("schema_version") or SCHEMA_VERSION),
     }
     # Drop any key whose value ended up empty after the str/clip dance; S3

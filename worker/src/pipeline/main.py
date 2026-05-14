@@ -20,27 +20,34 @@ import threading
 import time
 import traceback
 import uuid
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from pathlib import Path
 
 import boto3
 import structlog
 
-from .audio import convert_to_mono_wav, get_duration
+from .audio import convert_to_mono_wav, convert_to_speech_enhanced_wav, get_duration
 from .chunking import chunk_audio
 from .config import (
+    AUDIO_PREPROCESSING_MODE,
+    AUDIO_SLOW_DOWN,
+    ELEVENLABS_ENABLED,
+    ELEVENLABS_MODEL_ID,
     GLOSSARY_FILE_PATH,
     POSTPROCESS_ENABLED,
+    POSTPROCESS_MAX_CONCURRENT_PROVIDERS,
     POSTPROCESS_MODEL,
     TRANSLATION_FAILURE_THRESHOLD,
     TRANSLATION_MIN_SUBSTANTIAL_CHARS,
     get_anthropic_api_key,
 )
+from .elevenlabs_transcription import transcribe_all_chunks_elevenlabs
 from .postprocess import run_postprocess
 from .events import publish_job_event
 from .merger import merge
 from .metrics import emit_job_outcome, emit_translation_coverage
-from .results_writer import build_results_document, write_results
+from .results_writer import build_provider_output, build_results_document, write_results
 from .s3 import download_audio
 from .transcription import transcribe_all_chunks
 
@@ -118,6 +125,161 @@ def _delete_sqs_message(queue_url: str | None, receipt_handle: str | None) -> No
         logger.warning("Failed to delete SQS message", error=str(e))
 
 
+# ── Provider execution helpers ────────────────────────────────────────────────
+
+def _normalize_audio_for_pipeline(audio_path: Path, work_dir: Path, log) -> Path:
+    if AUDIO_PREPROCESSING_MODE == "speech_enhanced":
+        log.info("Normalizing audio with speech enhancement", slow_down=AUDIO_SLOW_DOWN)
+        return convert_to_speech_enhanced_wav(
+            audio_path,
+            work_dir,
+            slow_down=AUDIO_SLOW_DOWN,
+        )
+    if AUDIO_PREPROCESSING_MODE != "standard":
+        raise RuntimeError(
+            "AUDIO_PREPROCESSING_MODE must be 'standard' or 'speech_enhanced' "
+            f"(got {AUDIO_PREPROCESSING_MODE!r})"
+        )
+    log.info("Normalizing audio to 16 kHz mono WAV")
+    return convert_to_mono_wav(audio_path, work_dir)
+
+
+def _check_sarvam_translation_coverage(merged, log) -> None:
+    substantial = [
+        s for s in merged
+        if len(s.text.strip()) >= TRANSLATION_MIN_SUBSTANTIAL_CHARS
+    ]
+    nonempty_src = len(substantial)
+    empty = sum(1 for s in substantial if not s.translation.strip())
+    fail_rate = (empty / nonempty_src) if nonempty_src else 0.0
+
+    total_text = sum(1 for s in merged if s.text.strip())
+    total_empty = sum(
+        1 for s in merged
+        if not s.translation.strip() and s.text.strip()
+    )
+    log.info(
+        "Translation coverage",
+        provider="sarvam",
+        language="en-IN",
+        empty_segments=empty,
+        nonempty_source=nonempty_src,
+        failure_rate=round(fail_rate, 4),
+        total_text_segments=total_text,
+        total_empty_translations=total_empty,
+        min_substantial_chars=TRANSLATION_MIN_SUBSTANTIAL_CHARS,
+    )
+    emit_translation_coverage(
+        language="en-IN",
+        empty_segments=empty,
+        nonempty_source=nonempty_src,
+    )
+    if fail_rate > TRANSLATION_FAILURE_THRESHOLD:
+        raise RuntimeError(
+            f"Translation failure rate {fail_rate:.1%} for en-IN "
+            f"exceeds threshold {TRANSLATION_FAILURE_THRESHOLD:.1%} "
+            f"({empty}/{nonempty_src} substantial segments empty)"
+        )
+
+
+def _run_sarvam_provider(chunks, log) -> dict:
+    start = time.monotonic()
+    log.info("provider=sarvam status=transcribing", num_chunks=len(chunks))
+    transcript_segments = transcribe_all_chunks(chunks)
+    log.info("provider=sarvam transcription complete", num_segments=len(transcript_segments))
+    merged = merge(chunks, transcript_segments)
+    _check_sarvam_translation_coverage(merged, log)
+    return {
+        "provider": "sarvam",
+        "model": "saaras:v3",
+        "merged": merged,
+        "metadata": {
+            "elapsed_seconds": round(time.monotonic() - start, 2),
+            "num_segments": len(merged),
+            "num_speakers": len(set(s.speaker_id for s in merged)),
+        },
+    }
+
+
+def _run_scribe_provider(chunks, log) -> dict:
+    start = time.monotonic()
+    log.info("provider=scribe_v2 status=transcribing", num_chunks=len(chunks))
+    transcript_segments = transcribe_all_chunks_elevenlabs(chunks)
+    log.info("provider=scribe_v2 transcription complete", num_segments=len(transcript_segments))
+    merged = merge(chunks, transcript_segments)
+    return {
+        "provider": "elevenlabs",
+        "model": ELEVENLABS_MODEL_ID,
+        "merged": merged,
+        "metadata": {
+            "elapsed_seconds": round(time.monotonic() - start, 2),
+            "num_segments": len(merged),
+            "num_speakers": len(set(s.speaker_id for s in merged)),
+        },
+    }
+
+
+def _run_provider_postprocess(name: str, provider: dict, api_key: str, log) -> dict:
+    source_provider = "scribe_v2" if name == "scribe_v2" else "sarvam"
+    pp_result = run_postprocess(
+        provider["merged"],
+        api_key=api_key,
+        model=POSTPROCESS_MODEL,
+        glossary_path=GLOSSARY_FILE_PATH,
+        source_provider=source_provider,
+    )
+    log.info(
+        "Postprocessing complete",
+        provider=name,
+        normalized_segments=len(pp_result.normalized),
+        glossary_corrections=len(pp_result.glossary_corrections),
+    )
+    return {
+        "normalized": pp_result.normalized,
+        "postprocess": {
+            "model": pp_result.model,
+            "glossary_corrections": pp_result.glossary_corrections,
+            "translation_source": "claude" if name == "scribe_v2" else "provider_then_claude",
+            "script_restoration": name == "scribe_v2",
+        },
+    }
+
+
+def _run_provider_pipeline(
+    name: str,
+    chunks,
+    log,
+    *,
+    anthropic_api_key: str,
+    postprocess_gate: threading.Semaphore,
+) -> dict:
+    if name == "sarvam":
+        provider = _run_sarvam_provider(chunks, log)
+    elif name == "scribe_v2":
+        provider = _run_scribe_provider(chunks, log)
+    else:
+        raise ValueError(f"Unknown provider: {name}")
+
+    if POSTPROCESS_ENABLED and anthropic_api_key:
+        with postprocess_gate:
+            try:
+                provider.update(
+                    _run_provider_postprocess(
+                        name,
+                        provider,
+                        anthropic_api_key,
+                        log,
+                    )
+                )
+            except Exception as e:
+                log.warning(
+                    "Postprocessing failed — provider results will have empty normalized fields",
+                    provider=name,
+                    error=str(e),
+                )
+    return provider
+
+
 # ── Core pipeline ─────────────────────────────────────────────────────────────
 
 def process_job(
@@ -159,13 +321,10 @@ def process_job(
             audio_path = download_audio(s3_bucket, s3_key, work_dir)
 
             # ── 2. Normalize to 16 kHz mono PCM WAV up-front ─────────────
-            # One canonical format for the whole pipeline. The resulting
-            # WAV always has a usable RIFF duration header, which fixes
-            # browser-recorded WebM uploads (Chrome MediaRecorder omits
-            # Matroska Duration) and handles video-muxed containers in
-            # the same pass via `-vn`.
-            log.info("Normalizing audio to 16 kHz mono WAV")
-            audio_path = convert_to_mono_wav(audio_path, work_dir)
+            # One canonical format for VAD and both STT providers. The
+            # resulting WAV has a usable RIFF duration header and drops any
+            # video stream via ffmpeg.
+            audio_path = _normalize_audio_for_pipeline(audio_path, work_dir, log)
             duration = get_duration(audio_path)
             if duration <= 0:
                 raise RuntimeError(
@@ -179,110 +338,113 @@ def process_job(
             num_chunks = len(chunks)
             log.info("Chunks created", count=num_chunks)
 
-            # ── 4. Transcribe + translate chunks (parallel) ───────────────
-            # `transcribe_all_chunks` runs TWO Saaras batch jobs per chunk:
-            #   - mode=codemix   → original-language transcription + diarization
-            #   - mode=translate → English text, mapped onto codemix segments
-            #                       by timestamp overlap
-            # Both jobs run in parallel; the codemix pass owns the canonical
-            # timeline / speaker IDs. Each returned `TranscriptSegment` has
-            # `text` (original) and `translation` (English) populated.
-            log.info("status=transcribing", num_chunks=num_chunks)
-            transcript_segments = transcribe_all_chunks(chunks)
-            log.info("Transcription complete", num_segments=len(transcript_segments))
-
-            # ── 5. Merge + stitch speakers across chunks ──────────────────
-            log.info("status=merging")
-            merged = merge(chunks, transcript_segments)
-            num_segments = len(merged)
-            log.info("Merge complete", num_merged=num_segments)
-
-            # ── 6. Translation coverage check ─────────────────────────────
-            # Translation is produced inline by Sarvam's translate pass and
-            # carried on each merged segment. Empty `translation` on a
-            # short backchannel ("Hmm", "Okay", "Skirt") is *expected* under
-            # the single-best-match overlap zip — those segments simply have
-            # no translate-pass segment that maps to them. We therefore
-            # measure failure only on **substantial** segments (text length
-            # ≥ TRANSLATION_MIN_SUBSTANTIAL_CHARS). Empty translation on a
-            # substantial segment is the real signal of trouble.
-            substantial = [
-                s for s in merged
-                if len(s.text.strip()) >= TRANSLATION_MIN_SUBSTANTIAL_CHARS
-            ]
-            nonempty_src = len(substantial)
-            empty = sum(1 for s in substantial if not s.translation.strip())
-            fail_rate = (empty / nonempty_src) if nonempty_src else 0.0
-
-            # Also track the broader signal for observability (every segment
-            # with text vs every segment with translation), but don't gate
-            # on it — the gate uses the substantial-only rate above.
-            total_text = sum(1 for s in merged if s.text.strip())
-            total_empty = sum(
-                1 for s in merged
-                if not s.translation.strip() and s.text.strip()
-            )
+            # ── 4. Provider-parallel transcription + postprocess ──────────
             log.info(
-                "Translation coverage",
-                language="en-IN",
-                empty_segments=empty,
-                nonempty_source=nonempty_src,
-                failure_rate=round(fail_rate, 4),
-                total_text_segments=total_text,
-                total_empty_translations=total_empty,
-                min_substantial_chars=TRANSLATION_MIN_SUBSTANTIAL_CHARS,
+                "status=transcribing",
+                num_chunks=num_chunks,
+                elevenlabs_enabled=ELEVENLABS_ENABLED,
             )
-            emit_translation_coverage(
-                language="en-IN",
-                empty_segments=empty,
-                nonempty_source=nonempty_src,
-            )
-            if fail_rate > TRANSLATION_FAILURE_THRESHOLD:
-                raise RuntimeError(
-                    f"Translation failure rate {fail_rate:.1%} for en-IN "
-                    f"exceeds threshold {TRANSLATION_FAILURE_THRESHOLD:.1%} "
-                    f"({empty}/{nonempty_src} substantial segments empty)"
-                )
-
-            # ── 7. LLM normalisation (optional) ──────────────────────────
-            pp_normalized = None
-            pp_meta = None
+            anthropic_api_key = ""
             if POSTPROCESS_ENABLED:
                 try:
-                    api_key = get_anthropic_api_key()
+                    anthropic_api_key = get_anthropic_api_key()
                 except Exception as e:
                     log.warning("Could not retrieve Anthropic API key — skipping postprocess", error=str(e))
-                    api_key = ""
-                if api_key:
-                    log.info("status=postprocessing", model=POSTPROCESS_MODEL)
+            if anthropic_api_key:
+                log.info(
+                    "provider-lane postprocessing enabled",
+                    model=POSTPROCESS_MODEL,
+                    max_concurrent=POSTPROCESS_MAX_CONCURRENT_PROVIDERS,
+                )
+            elif POSTPROCESS_ENABLED:
+                log.info("ANTHROPIC_API_KEY not set — skipping postprocess")
+
+            providers: dict[str, dict] = {}
+            provider_errors: dict[str, str] = {}
+            postprocess_gate = threading.Semaphore(
+                max(1, POSTPROCESS_MAX_CONCURRENT_PROVIDERS)
+            )
+            with ThreadPoolExecutor(max_workers=2) as executor:
+                future_to_provider = {
+                    executor.submit(
+                        _run_provider_pipeline,
+                        "sarvam",
+                        chunks,
+                        log,
+                        anthropic_api_key=anthropic_api_key,
+                        postprocess_gate=postprocess_gate,
+                    ): "sarvam",
+                }
+                if ELEVENLABS_ENABLED:
+                    future_to_provider[
+                        executor.submit(
+                            _run_provider_pipeline,
+                            "scribe_v2",
+                            chunks,
+                            log,
+                            anthropic_api_key=anthropic_api_key,
+                            postprocess_gate=postprocess_gate,
+                        )
+                    ] = "scribe_v2"
+
+                for future in as_completed(future_to_provider):
+                    provider_name = future_to_provider[future]
                     try:
-                        pp_result = run_postprocess(
-                            merged,
-                            api_key=api_key,
-                            model=POSTPROCESS_MODEL,
-                            glossary_path=GLOSSARY_FILE_PATH,
-                        )
-                        pp_normalized = pp_result.normalized
-                        pp_meta = {
-                            "model": pp_result.model,
-                            "glossary_corrections": pp_result.glossary_corrections,
-                        }
-                        log.info(
-                            "Postprocessing complete",
-                            normalized_segments=len(pp_normalized),
-                            glossary_corrections=len(pp_result.glossary_corrections),
-                        )
+                        providers[provider_name] = future.result()
                     except Exception as e:
+                        provider_errors[provider_name] = str(e)
                         log.warning(
-                            "Postprocessing failed — results will have empty normalized fields",
+                            "Provider failed",
+                            provider=provider_name,
                             error=str(e),
                         )
-                else:
-                    log.info("ANTHROPIC_API_KEY not set — skipping postprocess")
+                        if provider_name == "sarvam":
+                            raise
 
-            # ── 8. Assemble + persist results JSON to S3 ──────────────────
+            sarvam_provider = providers["sarvam"]
+            merged = sarvam_provider["merged"]
+            num_segments = len(merged)
             num_speakers = len(set(s.speaker_id for s in merged))
+
+            # ── 5. Assemble + persist results JSON to S3 ──────────────────
             completed_at = datetime.now(timezone.utc)
+
+            provider_outputs = {
+                "sarvam": build_provider_output(
+                    provider="sarvam",
+                    model=sarvam_provider["model"],
+                    merged=sarvam_provider["merged"],
+                    normalized=sarvam_provider.get("normalized"),
+                    postprocess_meta=sarvam_provider.get("postprocess"),
+                    metadata={
+                        **sarvam_provider.get("metadata", {}),
+                        "preprocessing_mode": AUDIO_PREPROCESSING_MODE,
+                    },
+                )
+            }
+            if ELEVENLABS_ENABLED:
+                if "scribe_v2" in providers:
+                    scribe_provider = providers["scribe_v2"]
+                    provider_outputs["scribe_v2"] = build_provider_output(
+                        provider="elevenlabs",
+                        model=scribe_provider["model"],
+                        merged=scribe_provider["merged"],
+                        normalized=scribe_provider.get("normalized"),
+                        postprocess_meta=scribe_provider.get("postprocess"),
+                        metadata={
+                            **scribe_provider.get("metadata", {}),
+                            "preprocessing_mode": AUDIO_PREPROCESSING_MODE,
+                        },
+                        fill_translation_from_normalized=True,
+                    )
+                else:
+                    provider_outputs["scribe_v2"] = build_provider_output(
+                        provider="elevenlabs",
+                        model=ELEVENLABS_MODEL_ID,
+                        status="failed",
+                        error=provider_errors.get("scribe_v2", "unknown error"),
+                        metadata={"preprocessing_mode": AUDIO_PREPROCESSING_MODE},
+                    )
 
             document = build_results_document(
                 job_id=job_id,
@@ -291,13 +453,10 @@ def process_job(
                 original_filename=original_filename,
                 audio_duration_seconds=duration,
                 num_chunks=num_chunks,
-                num_speakers=num_speakers,
                 source_language=None,  # Sarvam auto-detects; we don't surface it per-job yet
-                merged=merged,
                 started_at=started_at,
                 completed_at=completed_at,
-                normalized=pp_normalized,
-                postprocess_meta=pp_meta,
+                provider_outputs=provider_outputs,
             )
             results_location = write_results(job_id, document)
 

@@ -41,8 +41,22 @@ fi
 # Optional — enables LLM normalisation in the worker.
 # If set, the key is stored in Secrets Manager and the task def env is wired up.
 : "${ANTHROPIC_API_KEY:=}"
-: "${POSTPROCESS_ENABLED:=false}"
+: "${POSTPROCESS_ENABLED:=true}"
 : "${POSTPROCESS_MODEL:=claude-sonnet-4-6}"
+: "${ELEVENLABS_API_KEY:=}"
+: "${ELEVENLABS_ENABLED:=true}"
+: "${ELEVENLABS_MODEL_ID:=scribe_v2}"
+: "${ELEVENLABS_MAX_CONCURRENT_CHUNKS:=2}"
+: "${ELEVENLABS_LANGUAGE_CODE:=}"
+: "${ELEVENLABS_NO_VERBATIM:=true}"
+: "${ELEVENLABS_NUM_SPEAKERS:=}"
+: "${ELEVENLABS_TEMPERATURE:=0.0}"
+: "${ELEVENLABS_REQUEST_TIMEOUT_S:=1800}"
+: "${ELEVENLABS_KEYTERMS_FROM_GLOSSARY:=true}"
+: "${ELEVENLABS_MAX_UPLOAD_BYTES:=3000000000}"
+: "${ELEVENLABS_MAX_DURATION_S:=36000}"
+: "${AUDIO_PREPROCESSING_MODE:=standard}"
+: "${AUDIO_SLOW_DOWN:=false}"
 
 # ── Derived names (industry-standard scheme) ─────────────────────────────────
 NS="${APP}-${ENV}"
@@ -64,6 +78,7 @@ LAMBDA_NAME="${NS}-job-dispatcher"
 LOG_GROUP_LAMBDA="/aws/lambda/${LAMBDA_NAME}"
 SARVAM_SECRET_NAME="${APP}/${ENV}/sarvam-api-key"
 ANTHROPIC_SECRET_NAME="${APP}/${ENV}/anthropic-api-key"
+ELEVENLABS_SECRET_NAME="${APP}/${ENV}/elevenlabs-api-key"
 EXEC_ROLE="${NS}-ecs-execution-role"
 TASK_ROLE="${NS}-worker-task-role"
 LAMBDA_ROLE="${NS}-job-dispatcher-role"
@@ -242,6 +257,22 @@ phase_storage() {
   else
     warn "ANTHROPIC_API_KEY not set — skipping Anthropic secret. LLM normalisation will be disabled."
   fi
+
+  # ElevenLabs secret — optional; only stored when ELEVENLABS_API_KEY is provided.
+  if [[ -n "${ELEVENLABS_API_KEY}" ]]; then
+    if aws secretsmanager describe-secret --secret-id "${ELEVENLABS_SECRET_NAME}" --region "${AWS_REGION}" >/dev/null 2>&1; then
+      aws secretsmanager put-secret-value --region "${AWS_REGION}" \
+        --secret-id "${ELEVENLABS_SECRET_NAME}" \
+        --secret-string "${ELEVENLABS_API_KEY}" >/dev/null
+    else
+      aws secretsmanager create-secret --region "${AWS_REGION}" \
+        --name "${ELEVENLABS_SECRET_NAME}" \
+        --secret-string "${ELEVENLABS_API_KEY}" >/dev/null
+    fi
+    ok "Secret: ${ELEVENLABS_SECRET_NAME}"
+  else
+    warn "ELEVENLABS_API_KEY not set — skipping ElevenLabs secret. Scribe v2 will be disabled unless secret already exists."
+  fi
 }
 
 phase_network() {
@@ -369,6 +400,7 @@ phase_iam() {
     {"Sid":"WriteResultsToS3","Effect":"Allow","Action":["s3:PutObject"],"Resource":"arn:aws:s3:::${S3_BUCKET}/${S3_RESULTS_PREFIX}*"},
     {"Sid":"ReadSarvamSecret","Effect":"Allow","Action":["secretsmanager:GetSecretValue"],"Resource":"arn:aws:secretsmanager:${AWS_REGION}:${AWS_ACCOUNT_ID}:secret:${SARVAM_SECRET_NAME}-*"},
     {"Sid":"ReadAnthropicSecret","Effect":"Allow","Action":["secretsmanager:GetSecretValue"],"Resource":"arn:aws:secretsmanager:${AWS_REGION}:${AWS_ACCOUNT_ID}:secret:${ANTHROPIC_SECRET_NAME}-*"},
+    {"Sid":"ReadElevenLabsSecret","Effect":"Allow","Action":["secretsmanager:GetSecretValue"],"Resource":"arn:aws:secretsmanager:${AWS_REGION}:${AWS_ACCOUNT_ID}:secret:${ELEVENLABS_SECRET_NAME}-*"},
     {"Sid":"InputQueueLifecycle","Effect":"Allow","Action":["sqs:ChangeMessageVisibility","sqs:DeleteMessage","sqs:GetQueueAttributes"],"Resource":"${INPUT_QUEUE_ARN}"},
     {"Sid":"PublishCompletionEvents","Effect":"Allow","Action":["sqs:SendMessage"],"Resource":"${EVENTS_QUEUE_ARN}"},
     {"Sid":"WriteLogs","Effect":"Allow","Action":["logs:CreateLogStream","logs:PutLogEvents"],"Resource":"arn:aws:logs:${AWS_REGION}:${AWS_ACCOUNT_ID}:log-group:${LOG_GROUP_WORKER}:*"}
@@ -448,7 +480,21 @@ phase_ecs() {
       {"name": "METRICS_NAMESPACE",            "value": "AnchorVoice"},
       {"name": "POSTPROCESS_ENABLED",          "value": "${POSTPROCESS_ENABLED}"},
       {"name": "POSTPROCESS_MODEL",            "value": "${POSTPROCESS_MODEL}"},
-      {"name": "ANTHROPIC_SECRET_NAME",        "value": "${ANTHROPIC_SECRET_NAME}"}
+      {"name": "ANTHROPIC_SECRET_NAME",        "value": "${ANTHROPIC_SECRET_NAME}"},
+      {"name": "ELEVENLABS_ENABLED",           "value": "${ELEVENLABS_ENABLED}"},
+      {"name": "ELEVENLABS_MODEL_ID",          "value": "${ELEVENLABS_MODEL_ID}"},
+      {"name": "ELEVENLABS_SECRET_NAME",       "value": "${ELEVENLABS_SECRET_NAME}"},
+      {"name": "ELEVENLABS_MAX_CONCURRENT_CHUNKS", "value": "${ELEVENLABS_MAX_CONCURRENT_CHUNKS}"},
+      {"name": "ELEVENLABS_LANGUAGE_CODE",     "value": "${ELEVENLABS_LANGUAGE_CODE}"},
+      {"name": "ELEVENLABS_NO_VERBATIM",       "value": "${ELEVENLABS_NO_VERBATIM}"},
+      {"name": "ELEVENLABS_NUM_SPEAKERS",      "value": "${ELEVENLABS_NUM_SPEAKERS}"},
+      {"name": "ELEVENLABS_TEMPERATURE",       "value": "${ELEVENLABS_TEMPERATURE}"},
+      {"name": "ELEVENLABS_REQUEST_TIMEOUT_S", "value": "${ELEVENLABS_REQUEST_TIMEOUT_S}"},
+      {"name": "ELEVENLABS_KEYTERMS_FROM_GLOSSARY", "value": "${ELEVENLABS_KEYTERMS_FROM_GLOSSARY}"},
+      {"name": "ELEVENLABS_MAX_UPLOAD_BYTES",  "value": "${ELEVENLABS_MAX_UPLOAD_BYTES}"},
+      {"name": "ELEVENLABS_MAX_DURATION_S",    "value": "${ELEVENLABS_MAX_DURATION_S}"},
+      {"name": "AUDIO_PREPROCESSING_MODE",     "value": "${AUDIO_PREPROCESSING_MODE}"},
+      {"name": "AUDIO_SLOW_DOWN",              "value": "${AUDIO_SLOW_DOWN}"}
     ],
     "logConfiguration": {
       "logDriver": "awslogs",
