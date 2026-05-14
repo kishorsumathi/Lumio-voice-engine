@@ -173,10 +173,17 @@ Apply these four cleanup passes in this order:
      h) Never in output — no markdown, no speaker labels, no [inaudible].
 
   4. NOISE
-     Remove: filler words ("uh", "um", "you know"), back-channels ("hmm",
-     "mm-hmm", "haan haan"), stutters, false starts, ASR doublings.
+     Preserve short listener acknowledgements and back-channels when they are
+     the whole segment or clinically/conversationally meaningful: "Mm-hmm.",
+     "hmm", "haan", "haan haan", "okay", "right". Do not blank these segments.
+
+     Remove only non-meaningful filler inside longer sentences when it does not
+     change meaning: "uh", "um", "you know", repeated "I I I", obvious false
+     starts, ASR doublings.
+
      PRESERVE: emotionally weighted hesitation ("I just— I just can't"),
-     genuine tearful repetition, patient self-corrections that change meaning.
+     genuine tearful repetition, patient self-corrections that change meaning,
+     and standalone acknowledgements/back-channels.
 </task>
 
 <rules>
@@ -192,6 +199,9 @@ HARD RULES:
   - NEVER add speaker labels ("Therapist:", "Patient:", "Speaker N:").
   - cleaned_translation is English ONLY.
   - Empty input (transcription="" and translation="") → return both empty.
+  - If the input segment is a standalone acknowledgement/back-channel such as
+    "Mm-hmm.", "hmm", "haan", "okay", or "right", return it in
+    cleaned_transcription and cleaned_translation instead of returning empty.
   - For each notable clinical mishearing fixed, add {heard, corrected} to
     glossary_corrections.
 </rules>
@@ -217,6 +227,12 @@ Example C — SCRIPT_RESTORATION (real-world sentence)
 Example D — NOISE
   input:  "so um I I I was thinking like you know maybe maybe we should um titrate the dose up to 50 milligrams"
   output: "I was thinking maybe we should titrate the dose up to 50 milligrams."
+
+Example E — STANDALONE ACKNOWLEDGEMENT
+  input transcription:  "Mm-hmm."
+  input translation:    ""
+  cleaned_transcription: "Mm-hmm."
+  cleaned_translation:   "Mm-hmm."
 </examples>
 
 <output_contract>
