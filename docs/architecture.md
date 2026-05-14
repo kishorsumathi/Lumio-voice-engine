@@ -331,11 +331,11 @@ Why a claim-check over inlining in SQS:
 - Any additional consumer (search indexer, analytics, export job) reads the
   same object — results are never re-fanned out as big SQS payloads.
 
-**Schema (v1) — S3 results JSON:**
+**Schema (v2) — S3 results JSON:**
 
 ```jsonc
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "job_id": "4f2e9a1c-7b8d-4e3a-a1f2-0c9d5e7b3f42",
   "status": "completed",
 

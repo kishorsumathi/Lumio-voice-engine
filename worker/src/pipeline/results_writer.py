@@ -33,7 +33,7 @@ from .merger import MergedSegment
 
 logger = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 _s3_client = None
 
@@ -143,7 +143,7 @@ def build_results_document(
     """
     Assemble the results JSON document (returned as a Python dict, not serialized).
 
-    Schema (v1):
+    Schema (v2):
       schema_version, job_id, status
       source { bucket, key, original_filename }
       summary { audio_duration_seconds, num_chunks, source_language }

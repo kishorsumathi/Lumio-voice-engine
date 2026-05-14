@@ -160,7 +160,7 @@ pointer (bucket + key + size + etag) into this object.
 
 ```jsonc
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "job_id": "4f2e9a1c-…",
   "status": "completed",
   "source":  { "bucket": "...", "key": "uploads/…", "original_filename": "…" },
