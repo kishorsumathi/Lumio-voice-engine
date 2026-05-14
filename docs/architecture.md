@@ -38,10 +38,12 @@ Target users: doctors, therapists, psychiatrists recording clinical sessions.
 │  ┌────────────────────────────────────────────┐                 │
 │  │  Pipeline (main.py)                        │                 │
 │  │    1. Download from S3                     │                 │
-│  │    2. VAD chunking (silero-vad)            │                 │
+│  │    2. Normalize audio                      │                 │
 │  │    3. Provider lanes in parallel:          │                 │
 │  │         Sarvam Saaras v3          ─────────┼─► Sarvam API    │
+│  │         (VAD chunks)                       │                 │
 │  │         ElevenLabs Scribe v2      ─────────┼─► ElevenLabs API│
+│  │         (full audio when possible)         │                 │
 │  │    4. Per-provider speaker stitching       │                 │
 │  │    5. Claude per provider as soon as       ├─► Anthropic API │
 │  │       that provider's STT + merge is done  │  (Claude Sonnet) │
@@ -126,12 +128,12 @@ For long audio, **silero-vad** runs on **`{stem}_16k_mono.wav`**; Sarvam **`chun
 
 **File:** `main.py`
 
-After chunking, the worker starts independent provider lanes with `ThreadPoolExecutor(max_workers=2)`:
+After normalization, the worker starts independent provider lanes with `ThreadPoolExecutor(max_workers=2)`. Sarvam receives VAD chunks; Scribe v2 receives the full normalized audio when it fits the configured ElevenLabs limits and falls back to chunks only when the full audio is too large or too long:
 
 ```
 chunks
   ├── Sarvam lane: Saaras codemix + translate → merge → Claude postprocess
-  └── Scribe lane: ElevenLabs Scribe v2       → merge → Claude postprocess
+  └── Scribe lane: full audio or chunks       → merge → Claude postprocess
 ```
 
 The lanes do not wait for each other between STT and Claude. If Sarvam finishes first, Sarvam's Claude postprocess begins while Scribe v2 may still be transcribing; if Scribe finishes first, Scribe's Claude postprocess begins while Sarvam may still be running. Claude concurrency is bounded by `POSTPROCESS_MAX_CONCURRENT_PROVIDERS` (default `2`). Anthropic rate limits are account/model/tier-specific and enforced across RPM, input-token-per-minute, and output-token-per-minute limits, so the default is intentionally one Claude slot per provider lane rather than an aggressive hardcoded value.
@@ -191,13 +193,15 @@ Both Saaras jobs run on the same audio, so diarization boundaries usually agree 
 
 **File:** `elevenlabs_transcription.py`
 
-When `ELEVENLABS_ENABLED=true`, the Scribe v2 lane sends each chunk to ElevenLabs Speech to Text with diarization, word timestamps, `no_verbatim=true`, and glossary-derived `keyterms` when enabled. `ELEVENLABS_NUM_SPEAKERS` is empty by default so Scribe v2 infers the speaker count.
+When `ELEVENLABS_ENABLED=true`, the Scribe v2 lane first tries to send the full normalized audio file to ElevenLabs Speech to Text with diarization, word timestamps, `no_verbatim=true`, and glossary-derived `keyterms` when enabled. `ELEVENLABS_NUM_SPEAKERS` is empty by default so Scribe v2 infers the speaker count.
 
-The adapter validates every chunk before upload:
+The adapter validates the full audio before upload:
 
 - `ELEVENLABS_MAX_UPLOAD_BYTES` defaults to `3000000000` bytes (3.0 GB).
 - `ELEVENLABS_MAX_DURATION_S` defaults to `36000` seconds (10 hours).
-- `ELEVENLABS_MAX_CONCURRENT_CHUNKS` defaults to `2` to avoid aggressive API fan-out.
+- If the full audio fits those limits, Scribe v2 receives one request and its `metadata.input_mode` is `full_audio`.
+- If the full audio exceeds either limit, Scribe v2 falls back to the Sarvam chunk list and `metadata.input_mode` is `chunked`.
+- `ELEVENLABS_MAX_CONCURRENT_CHUNKS` defaults to `2` and only applies to the chunked fallback path.
 - 429 and 5xx failures retry with exponential backoff and respect `Retry-After` when the API provides it.
 
 Scribe v2 does not provide Sarvam-style English translate-mode output, so its raw segment `translation` fields are empty until Claude postprocess generates `normalized_translation`; the result writer can then expose that cleaned translation on the provider segment output.
@@ -516,9 +520,9 @@ This is a sliding window (not a fixed 60s bucket), so the rate is smooth with no
 | Sarvam 5xx / network timeout | `@retry` exponential backoff (3 attempts, 10s–60s) |
 | Chunk codemix-pass failure (after retries) | Raises immediately — job emits `job.failed` event, no results file written |
 | Chunk translate-pass returns 0 segments | Logged at WARNING; chunk's transcription is preserved with empty `translation` per segment; the global coverage check may still fail the job if too many chunks are affected |
-| Translation coverage below threshold | Job fails with `Translation failure rate X% for en-IN exceeds threshold Y%` and message redelivers (default `TRANSLATION_FAILURE_THRESHOLD=0.05`) |
+| Translation coverage below threshold | Job fails with `Translation failure rate X% for en-IN exceeds threshold Y%` and message redelivers (default `TRANSLATION_FAILURE_THRESHOLD=0.60`) |
 | pyannote / diarization | Removed — not used. Sarvam provides per-chunk diarization in both modes |
-| Audio over 60 min | VAD chunking with overlap — no size limit |
+| Audio over 60 min | Sarvam uses VAD chunking with overlap. Scribe v2 uses full audio up to the configured 10-hour / 3 GB guard, then falls back to chunks. |
 | Video file input | ffmpeg extracts audio-only before processing |
 | No silence gap found | Force-cut 60s before hard chunk limit |
 | SQS visibility timeout (long jobs) | Heartbeat thread extends visibility every 5 min |
@@ -530,12 +534,12 @@ This is a sliding window (not a fixed 60s bucket), so the rate is smooth with no
 ## Job Status State Machine
 
 ```
-pending → downloading → chunking → provider lanes → completed
-                                  │
-                                  ├─ Sarvam: codemix + translate → merge → [normalising]
-                                  └─ Scribe: Scribe v2           → merge → [normalising]
-                                                               ↓ (any required stage)
-                                                               failed
+pending → downloading → normalizing → provider lanes → completed
+                                    │
+                                    ├─ Scribe: full audio if allowed → merge → [normalising]
+                                    └─ Sarvam: chunking → codemix + translate → merge → [normalising]
+                                                                 ↓ (any required stage)
+                                                                 failed
 ```
 
 `normalising` is skipped silently if `POSTPROCESS_ENABLED=false` or the Anthropic API key is absent. A normalisation failure is logged as a warning and that provider continues to `completed` with empty `normalized_transcript` / `normalized_translation` fields. Scribe v2 failure does not fail the job if Sarvam succeeds; Sarvam failure still fails the job.
@@ -579,19 +583,19 @@ Most options are environment variables:
 | `GLOSSARY_FILE_PATH` | `/app/glossary.json` | Path to the clinical glossary JSON file. Bundled in the image; override to mount a custom file. |
 | `AUDIO_PREPROCESSING_MODE` | `standard` | `standard` for plain 16 kHz mono WAV conversion, or `speech_enhanced` for high/low-pass filtering, speech EQ, dynamic normalisation, and limiting. |
 | `AUDIO_SLOW_DOWN` | `false` | When `speech_enhanced`, optionally applies `atempo=0.94` for batch transcription. |
-| `ELEVENLABS_ENABLED` | `true` | Enables a separate top-level `scribe_v2` provider output. Sarvam and Scribe v2 start in parallel after chunking, and each provider starts Claude postprocess as soon as its own STT + merge completes. |
+| `ELEVENLABS_ENABLED` | `true` | Enables a separate top-level `scribe_v2` provider output. Sarvam and Scribe v2 start in parallel after normalization, and each provider starts Claude postprocess as soon as its own STT + merge completes. |
 | `ELEVENLABS_MODEL_ID` | `scribe_v2` | ElevenLabs Speech to Text model ID. |
 | `ELEVENLABS_API_KEY` | — | Direct API key (local dev). In production use `ELEVENLABS_SECRET_NAME` instead. |
 | `ELEVENLABS_SECRET_NAME` | `anchor-voice/elevenlabs-api-key` | Secrets Manager secret name for the ElevenLabs key. |
-| `ELEVENLABS_MAX_CONCURRENT_CHUNKS` | `2` | Maximum Scribe v2 chunk requests in flight. Keep conservative; retry handles `429` / `5xx`. |
+| `ELEVENLABS_MAX_CONCURRENT_CHUNKS` | `2` | Maximum Scribe v2 chunk requests in flight when full-audio mode exceeds the configured size/duration limits. Keep conservative; retry handles `429` / `5xx`. |
 | `ELEVENLABS_LANGUAGE_CODE` | — | Optional ISO language code; empty means Scribe detects language. |
 | `ELEVENLABS_NO_VERBATIM` | `true` | Removes filler words, false starts, and non-speech sounds before Claude postprocess. |
 | `ELEVENLABS_NUM_SPEAKERS` | — | Optional speaker-count hint. Empty by default so Scribe v2 infers speakers up to its supported maximum. |
 | `ELEVENLABS_TEMPERATURE` | `0.0` | Keeps Scribe output deterministic and accuracy-oriented. |
 | `ELEVENLABS_REQUEST_TIMEOUT_S` | `1800` | Synchronous Scribe v2 request timeout in seconds. |
 | `ELEVENLABS_KEYTERMS_FROM_GLOSSARY` | `true` | Sends glossary terms/correction targets as Scribe v2 keyterms, within ElevenLabs documented limits. |
-| `ELEVENLABS_MAX_UPLOAD_BYTES` | `3000000000` | Per-request Scribe v2 upload guard. Chunks above this fail Scribe output with a clear error. |
-| `ELEVENLABS_MAX_DURATION_S` | `36000` | Per-request Scribe v2 duration guard (10 hours). Chunks above this fail Scribe output with a clear error. |
+| `ELEVENLABS_MAX_UPLOAD_BYTES` | `3000000000` | Per-request Scribe v2 upload guard. Full audio above this falls back to chunks; individual chunks above this fail Scribe output with a clear error. |
+| `ELEVENLABS_MAX_DURATION_S` | `36000` | Per-request Scribe v2 duration guard (10 hours). Full audio above this falls back to chunks; individual chunks above this fail Scribe output with a clear error. |
 
 Target-language configuration is no longer settable — translation is always English, produced by Sarvam Saaras `mode=translate` running in parallel with the codemix transcription pass. The previous `DEFAULT_TARGET_LANGUAGES` env var (and the per-upload `Target-Languages` S3 metadata override) are removed.
 

@@ -6,6 +6,7 @@ import logging
 import re
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -31,6 +32,13 @@ logger = logging.getLogger(__name__)
 _MAX_RETRIES = 5
 _MAX_SEGMENT_GAP_S = 1.5
 _UNSUPPORTED_KEYTERM_CHARS_RE = re.compile(r"[<>{}\[\]\\]")
+
+
+@dataclass
+class ElevenLabsTranscriptionResult:
+    segments: list[TranscriptSegment]
+    chunks: list[ChunkInfo]
+    input_mode: str
 
 
 def _get(obj: Any, key: str, default: Any = None) -> Any:
@@ -121,6 +129,31 @@ def _validate_chunk(chunk: ChunkInfo) -> None:
             f"ElevenLabs chunk {chunk.index} is {chunk.duration:.1f}s, exceeding "
             f"limit {ELEVENLABS_MAX_DURATION_S:.1f}s. Reduce MAX_CHUNK_DURATION_S."
         )
+
+
+def _full_audio_chunk(audio_path: Path, duration: float) -> ChunkInfo:
+    return ChunkInfo(
+        path=audio_path,
+        index=0,
+        start_time=0.0,
+        end_time=duration,
+        content_start=0.0,
+        duration=duration,
+        split_reason="full_audio",
+    )
+
+
+def _fits_elevenlabs_limits(chunk: ChunkInfo) -> bool:
+    size = chunk.path.stat().st_size
+    return (
+        size < ELEVENLABS_MAX_UPLOAD_BYTES
+        and chunk.duration <= ELEVENLABS_MAX_DURATION_S
+    )
+
+
+def can_transcribe_full_audio_elevenlabs(audio_path: Path, duration: float) -> bool:
+    """Return true when the normalized full audio fits one Scribe v2 request."""
+    return _fits_elevenlabs_limits(_full_audio_chunk(audio_path, duration))
 
 
 def _client():
@@ -291,3 +324,36 @@ def transcribe_all_chunks_elevenlabs(chunks: list[ChunkInfo]) -> list[Transcript
 
     all_segments.sort(key=lambda s: s.start_time)
     return all_segments
+
+
+def transcribe_audio_elevenlabs(
+    audio_path: Path,
+    duration: float,
+    fallback_chunks: list[ChunkInfo],
+) -> ElevenLabsTranscriptionResult:
+    """Prefer one full-audio Scribe v2 request; fall back to chunks if needed."""
+    full_chunk = _full_audio_chunk(audio_path, duration)
+    if _fits_elevenlabs_limits(full_chunk):
+        keyterms = _load_keyterms(GLOSSARY_FILE_PATH)
+        if keyterms:
+            logger.info("ElevenLabs keyterms loaded", extra={"count": len(keyterms)})
+        segments = _process_chunk(full_chunk, keyterms)
+        return ElevenLabsTranscriptionResult(
+            segments=segments,
+            chunks=[full_chunk],
+            input_mode="full_audio",
+        )
+
+    logger.info(
+        "ElevenLabs full audio exceeds configured limits; falling back to chunks "
+        "(size=%d, duration=%.1fs, max_size=%d, max_duration=%.1fs)",
+        full_chunk.path.stat().st_size,
+        full_chunk.duration,
+        ELEVENLABS_MAX_UPLOAD_BYTES,
+        ELEVENLABS_MAX_DURATION_S,
+    )
+    return ElevenLabsTranscriptionResult(
+        segments=transcribe_all_chunks_elevenlabs(fallback_chunks),
+        chunks=fallback_chunks,
+        input_mode="chunked",
+    )

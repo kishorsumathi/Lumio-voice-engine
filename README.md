@@ -11,10 +11,12 @@ S3 upload → EventBridge → SQS FIFO → Lambda → ECS Fargate
                                                     │
                                         ┌───────────┴───────────────────────┐
                                         │  Pipeline                         │
-                                        │  1. VAD chunking                  │
+                                        │  1. Normalize audio               │
                                         │  2. Provider lanes run in parallel│
                                         │       Sarvam Saaras v3       ─────┼──► codemix + translate
+                                        │       (VAD chunks)                │
                                         │       ElevenLabs Scribe v2   ─────┼──► diarized STT
+                                        │       (full audio when possible)  │
                                         │  3. Per-provider speaker stitching│
                                         │  4. Claude starts per provider    │
                                         │       as soon as that provider    ├──► Anthropic Claude
@@ -211,7 +213,7 @@ Full schema and consumer sketch: [docs/architecture.md](docs/architecture.md#sta
 - **No pyannote / no diarization model** — Sarvam provides per-chunk diarization; overlap text matching stitches speaker IDs across chunks.
 - **No NAT gateway** — ECS runs in public subnets with `assignPublicIp=ENABLED`; saves ~$32/month. No RDS, no private subnets.
 - **Two independent STT provider outputs** — Sarvam produces the top-level `sarvam` object, and ElevenLabs Scribe v2 produces the top-level `scribe_v2` object. They are not compared or merged together.
-- **Provider-lane parallelism** — Sarvam and Scribe v2 start in parallel after chunking. As soon as one provider finishes transcription and merge, its Claude postprocess starts immediately without waiting for the other provider. Claude concurrency is bounded by `POSTPROCESS_MAX_CONCURRENT_PROVIDERS` (default `2`, one slot per provider lane).
+- **Provider-lane parallelism** — Sarvam and Scribe v2 start in parallel after normalization. Sarvam uses VAD chunks; Scribe v2 sends the full normalized audio when it fits the configured 3 GB / 10 hour guard, falling back to chunks only when needed. As soon as one provider finishes transcription and merge, its Claude postprocess starts immediately without waiting for the other provider. Claude concurrency is bounded by `POSTPROCESS_MAX_CONCURRENT_PROVIDERS` (default `2`, one slot per provider lane).
 - **Sarvam uses one product, two modes** — transcription uses Saaras v3 `mode=codemix`, translation uses Saaras v3 `mode=translate`. No Mayura, no language-detection sidecar. Both passes run in parallel per chunk; outputs are merged by timestamp overlap.
 - **LLM normalisation pass (optional)** — Claude runs a clinical editing pass per provider: fixes misheard medical terms, restores romanised Indian-language text to native script (especially for Scribe v2), fixes formatting, removes ASR noise, and produces English translation for Scribe v2. Controlled via `POSTPROCESS_ENABLED` / `ANTHROPIC_SECRET_NAME`. Failures are logged and skipped — they never block job completion. Glossary of clinical terms and ASR corrections lives in `worker/glossary.json`. Full design in [docs/llm_postprocessing.md](docs/llm_postprocessing.md).
 - **100 RPM shared** — single sliding-window rate limiter across all Sarvam calls. The throttle is per-API-call, so the doubled per-chunk concurrency (codemix + translate) doesn't change the absolute Sarvam request rate.

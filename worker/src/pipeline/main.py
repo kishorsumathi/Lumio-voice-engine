@@ -42,7 +42,10 @@ from .config import (
     TRANSLATION_MIN_SUBSTANTIAL_CHARS,
     get_anthropic_api_key,
 )
-from .elevenlabs_transcription import transcribe_all_chunks_elevenlabs
+from .elevenlabs_transcription import (
+    can_transcribe_full_audio_elevenlabs,
+    transcribe_audio_elevenlabs,
+)
 from .postprocess import run_postprocess
 from .events import publish_job_event
 from .merger import merge
@@ -201,18 +204,23 @@ def _run_sarvam_provider(chunks, log) -> dict:
     }
 
 
-def _run_scribe_provider(chunks, log) -> dict:
+def _run_scribe_provider(chunks, audio_path: Path, audio_duration: float, log) -> dict:
     start = time.monotonic()
     log.info("provider=scribe_v2 status=transcribing", num_chunks=len(chunks))
-    transcript_segments = transcribe_all_chunks_elevenlabs(chunks)
-    log.info("provider=scribe_v2 transcription complete", num_segments=len(transcript_segments))
-    merged = merge(chunks, transcript_segments)
+    result = transcribe_audio_elevenlabs(audio_path, audio_duration, chunks)
+    log.info(
+        "provider=scribe_v2 transcription complete",
+        input_mode=result.input_mode,
+        num_segments=len(result.segments),
+    )
+    merged = merge(result.chunks, result.segments)
     return {
         "provider": "elevenlabs",
         "model": ELEVENLABS_MODEL_ID,
         "merged": merged,
         "metadata": {
             "elapsed_seconds": round(time.monotonic() - start, 2),
+            "input_mode": result.input_mode,
             "num_segments": len(merged),
             "num_speakers": len(set(s.speaker_id for s in merged)),
         },
@@ -250,13 +258,15 @@ def _run_provider_pipeline(
     chunks,
     log,
     *,
+    audio_path: Path,
+    audio_duration: float,
     anthropic_api_key: str,
     postprocess_gate: threading.Semaphore,
 ) -> dict:
     if name == "sarvam":
         provider = _run_sarvam_provider(chunks, log)
     elif name == "scribe_v2":
-        provider = _run_scribe_provider(chunks, log)
+        provider = _run_scribe_provider(chunks, audio_path, audio_duration, log)
     else:
         raise ValueError(f"Unknown provider: {name}")
 
@@ -332,18 +342,7 @@ def process_job(
                 )
             log.info("Audio ready", duration_s=round(duration, 1), filename=audio_path.name)
 
-            # ── 3. Chunk ─────────────────────────────────────────────────
-            log.info("status=chunking", audio_duration_seconds=round(duration, 2))
-            chunks = chunk_audio(audio_path, work_dir, already_normalized=True)
-            num_chunks = len(chunks)
-            log.info("Chunks created", count=num_chunks)
-
-            # ── 4. Provider-parallel transcription + postprocess ──────────
-            log.info(
-                "status=transcribing",
-                num_chunks=num_chunks,
-                elevenlabs_enabled=ELEVENLABS_ENABLED,
-            )
+            # ── 3. Provider setup ─────────────────────────────────────────
             anthropic_api_key = ""
             if POSTPROCESS_ENABLED:
                 try:
@@ -364,24 +363,66 @@ def process_job(
             postprocess_gate = threading.Semaphore(
                 max(1, POSTPROCESS_MAX_CONCURRENT_PROVIDERS)
             )
+
+            # ── 4. Scribe full-audio lane + Sarvam chunking ───────────────
+            # Scribe v2 can accept much larger inputs than Sarvam, so start it
+            # immediately on the normalized full audio when it fits. Sarvam
+            # still gets VAD chunks; Scribe only falls back to those chunks
+            # when the full audio exceeds the configured Scribe request limits.
             with ThreadPoolExecutor(max_workers=2) as executor:
-                future_to_provider = {
+                future_to_provider = {}
+                scribe_started = False
+                if (
+                    ELEVENLABS_ENABLED
+                    and can_transcribe_full_audio_elevenlabs(audio_path, duration)
+                ):
+                    log.info("provider=scribe_v2 launching full-audio transcription")
+                    future_to_provider[
+                        executor.submit(
+                            _run_provider_pipeline,
+                            "scribe_v2",
+                            [],
+                            log,
+                            audio_path=audio_path,
+                            audio_duration=duration,
+                            anthropic_api_key=anthropic_api_key,
+                            postprocess_gate=postprocess_gate,
+                        )
+                    ] = "scribe_v2"
+                    scribe_started = True
+
+                log.info("status=chunking", audio_duration_seconds=round(duration, 2))
+                chunks = chunk_audio(audio_path, work_dir, already_normalized=True)
+                num_chunks = len(chunks)
+                log.info("Chunks created", count=num_chunks)
+
+                log.info(
+                    "status=transcribing",
+                    num_chunks=num_chunks,
+                    elevenlabs_enabled=ELEVENLABS_ENABLED,
+                )
+                future_to_provider[
                     executor.submit(
                         _run_provider_pipeline,
                         "sarvam",
                         chunks,
                         log,
+                        audio_path=audio_path,
+                        audio_duration=duration,
                         anthropic_api_key=anthropic_api_key,
                         postprocess_gate=postprocess_gate,
-                    ): "sarvam",
-                }
-                if ELEVENLABS_ENABLED:
+                    )
+                ] = "sarvam"
+                if ELEVENLABS_ENABLED and not scribe_started:
+                    log.info("provider=scribe_v2 launching chunked transcription")
                     future_to_provider[
                         executor.submit(
                             _run_provider_pipeline,
                             "scribe_v2",
                             chunks,
                             log,
+                            audio_path=audio_path,
+                            audio_duration=duration,
                             anthropic_api_key=anthropic_api_key,
                             postprocess_gate=postprocess_gate,
                         )

@@ -54,7 +54,10 @@ from pipeline.config import (  # noqa: E402
     POSTPROCESS_MODEL,
     get_anthropic_api_key,
 )
-from pipeline.elevenlabs_transcription import transcribe_all_chunks_elevenlabs  # noqa: E402
+from pipeline.elevenlabs_transcription import (  # noqa: E402
+    can_transcribe_full_audio_elevenlabs,
+    transcribe_audio_elevenlabs,
+)
 from pipeline.merger import merge  # noqa: E402
 from pipeline.postprocess import run_postprocess  # noqa: E402
 from pipeline.results_writer import build_provider_output, build_results_document  # noqa: E402
@@ -118,15 +121,27 @@ def _postprocess_provider(name: str, merged, api_key: str):
     }
 
 
-def _run_provider_lane(name: str, chunks, api_key: str, gate: threading.Semaphore):
+def _run_provider_lane(
+    name: str,
+    chunks,
+    audio_path: Path,
+    duration: float,
+    api_key: str,
+    gate: threading.Semaphore,
+):
     if name == "sarvam":
         transcript_segs = transcribe_all_chunks(chunks)
+        merge_chunks = chunks
+        input_mode = "chunked"
     elif name == "scribe_v2":
-        transcript_segs = transcribe_all_chunks_elevenlabs(chunks)
+        result = transcribe_audio_elevenlabs(audio_path, duration, chunks)
+        transcript_segs = result.segments
+        merge_chunks = result.chunks
+        input_mode = result.input_mode
     else:
         raise ValueError(f"Unknown provider: {name}")
 
-    merged = merge(chunks, transcript_segs)
+    merged = merge(merge_chunks, transcript_segs)
     normalized, meta = ({}, None)
     if POSTPROCESS_ENABLED and api_key:
         with gate:
@@ -136,6 +151,7 @@ def _run_provider_lane(name: str, chunks, api_key: str, gate: threading.Semaphor
         "normalized": normalized,
         "meta": meta,
         "transcript_segments": len(transcript_segs),
+        "input_mode": input_mode,
     }
 
 
@@ -172,13 +188,6 @@ def run(audio_path: Path) -> None:
                 )
             print(f"Duration: {duration:.1f}s ({duration/60:.1f} min)")
 
-            chunks = chunk_audio(local_audio, work_dir, already_normalized=True)
-            print(f"Chunks: {len(chunks)}")
-            for c in chunks:
-                print(f"  [{c.index}] {c.start_time:.1f}s–{c.end_time:.1f}s "
-                      f"({c.duration/60:.1f}min) [{c.split_reason}]")
-
-            print("\nRunning provider transcription...")
             providers = {}
             provider_errors = {}
             anthropic_api_key = ""
@@ -192,22 +201,55 @@ def run(audio_path: Path) -> None:
             postprocess_gate = threading.Semaphore(
                 max(1, POSTPROCESS_MAX_CONCURRENT_PROVIDERS)
             )
+
+            print("\nRunning provider transcription...")
             with ThreadPoolExecutor(max_workers=2) as executor:
-                future_to_provider = {
+                future_to_provider = {}
+                scribe_started = False
+                if (
+                    ELEVENLABS_ENABLED
+                    and can_transcribe_full_audio_elevenlabs(local_audio, duration)
+                ):
+                    print("scribe_v2 input: full_audio")
+                    future_to_provider[
+                        executor.submit(
+                            _run_provider_lane,
+                            "scribe_v2",
+                            [],
+                            local_audio,
+                            duration,
+                            anthropic_api_key,
+                            postprocess_gate,
+                        )
+                    ] = "scribe_v2"
+                    scribe_started = True
+
+                chunks = chunk_audio(local_audio, work_dir, already_normalized=True)
+                print(f"Chunks: {len(chunks)}")
+                for c in chunks:
+                    print(f"  [{c.index}] {c.start_time:.1f}s–{c.end_time:.1f}s "
+                          f"({c.duration/60:.1f}min) [{c.split_reason}]")
+
+                future_to_provider[
                     executor.submit(
                         _run_provider_lane,
                         "sarvam",
                         chunks,
+                        local_audio,
+                        duration,
                         anthropic_api_key,
                         postprocess_gate,
-                    ): "sarvam",
-                }
-                if ELEVENLABS_ENABLED:
+                    )
+                ] = "sarvam"
+                if ELEVENLABS_ENABLED and not scribe_started:
+                    print("scribe_v2 input: chunked")
                     future_to_provider[
                         executor.submit(
                             _run_provider_lane,
                             "scribe_v2",
                             chunks,
+                            local_audio,
+                            duration,
                             anthropic_api_key,
                             postprocess_gate,
                         )
@@ -218,7 +260,8 @@ def run(audio_path: Path) -> None:
                         providers[name] = future.result()
                         print(
                             f"{name} transcript segments: "
-                            f"{providers[name]['transcript_segments']}"
+                            f"{providers[name]['transcript_segments']} "
+                            f"({providers[name]['input_mode']})"
                         )
                         if providers[name]["meta"]:
                             print(f"{name} postprocessed: {len(providers[name]['normalized'])} segments")
@@ -250,7 +293,10 @@ def run(audio_path: Path) -> None:
                     merged=providers["sarvam"]["merged"],
                     normalized=providers["sarvam"].get("normalized"),
                     postprocess_meta=providers["sarvam"].get("meta"),
-                    metadata={"preprocessing_mode": AUDIO_PREPROCESSING_MODE},
+                    metadata={
+                        "preprocessing_mode": AUDIO_PREPROCESSING_MODE,
+                        "input_mode": providers["sarvam"].get("input_mode"),
+                    },
                 )
             }
             if ELEVENLABS_ENABLED and "scribe_v2" in providers:
@@ -260,7 +306,10 @@ def run(audio_path: Path) -> None:
                     merged=providers["scribe_v2"]["merged"],
                     normalized=providers["scribe_v2"].get("normalized"),
                     postprocess_meta=providers["scribe_v2"].get("meta"),
-                    metadata={"preprocessing_mode": AUDIO_PREPROCESSING_MODE},
+                    metadata={
+                        "preprocessing_mode": AUDIO_PREPROCESSING_MODE,
+                        "input_mode": providers["scribe_v2"].get("input_mode"),
+                    },
                     fill_translation_from_normalized=True,
                 )
             elif ELEVENLABS_ENABLED:
