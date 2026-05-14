@@ -50,7 +50,7 @@ TRANSLATION_MIN_SUBSTANTIAL_CHARS: int = int(
 # ── Audio preprocessing ───────────────────────────────────────────────────────
 # `standard` keeps the existing 16 kHz mono PCM WAV conversion. `speech_enhanced`
 # applies light filtering/EQ/dynamic normalisation before transcription.
-AUDIO_PREPROCESSING_MODE: str = os.getenv("AUDIO_PREPROCESSING_MODE", "standard").lower()
+AUDIO_PREPROCESSING_MODE: str = os.getenv("AUDIO_PREPROCESSING_MODE", "speech_enhanced").lower()
 AUDIO_SLOW_DOWN: bool = os.getenv("AUDIO_SLOW_DOWN", "false").lower() == "true"
 
 # ── AWS ───────────────────────────────────────────────────────────────────────

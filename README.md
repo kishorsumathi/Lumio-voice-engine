@@ -82,7 +82,7 @@ export ELEVENLABS_ENABLED='true'        # default true — adds top-level scribe
 export ELEVENLABS_API_KEY='...'         # optional — stored in Secrets Manager when provided
 export ELEVENLABS_NO_VERBATIM='true'    # default true — removes fillers/false starts
 export ELEVENLABS_NUM_SPEAKERS=''       # optional; empty lets Scribe infer speakers
-export AUDIO_PREPROCESSING_MODE='standard'  # or speech_enhanced
+export AUDIO_PREPROCESSING_MODE='speech_enhanced'  # default; use standard for plain WAV conversion
 export AWS_REGION='ap-south-1'          # optional (default ap-south-1)
 export ENV='prd'                        # optional — names all resources ${APP}-${ENV}-*
 make deploy                             # full stack

@@ -581,7 +581,7 @@ Most options are environment variables:
 | `ANTHROPIC_API_KEY` | — | Direct API key (local dev). In production use `ANTHROPIC_SECRET_NAME` instead. |
 | `ANTHROPIC_SECRET_NAME` | `anchor-voice/anthropic-api-key` | Secrets Manager secret name for the Anthropic key. |
 | `GLOSSARY_FILE_PATH` | `/app/glossary.json` | Path to the clinical glossary JSON file. Bundled in the image; override to mount a custom file. |
-| `AUDIO_PREPROCESSING_MODE` | `standard` | `standard` for plain 16 kHz mono WAV conversion, or `speech_enhanced` for high/low-pass filtering, speech EQ, dynamic normalisation, and limiting. |
+| `AUDIO_PREPROCESSING_MODE` | `speech_enhanced` | `speech_enhanced` applies high/low-pass filtering, speech EQ, dynamic normalisation, and limiting before transcription. Set `standard` for plain 16 kHz mono WAV conversion. |
 | `AUDIO_SLOW_DOWN` | `false` | When `speech_enhanced`, optionally applies `atempo=0.94` for batch transcription. |
 | `ELEVENLABS_ENABLED` | `true` | Enables a separate top-level `scribe_v2` provider output. Sarvam and Scribe v2 start in parallel after normalization, and each provider starts Claude postprocess as soon as its own STT + merge completes. |
 | `ELEVENLABS_MODEL_ID` | `scribe_v2` | ElevenLabs Speech to Text model ID. |

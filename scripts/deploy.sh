@@ -55,7 +55,7 @@ fi
 : "${ELEVENLABS_KEYTERMS_FROM_GLOSSARY:=true}"
 : "${ELEVENLABS_MAX_UPLOAD_BYTES:=3000000000}"
 : "${ELEVENLABS_MAX_DURATION_S:=36000}"
-: "${AUDIO_PREPROCESSING_MODE:=standard}"
+: "${AUDIO_PREPROCESSING_MODE:=speech_enhanced}"
 : "${AUDIO_SLOW_DOWN:=false}"
 
 # ── Derived names (industry-standard scheme) ─────────────────────────────────
